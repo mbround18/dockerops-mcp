@@ -10,6 +10,10 @@ The server exists to replace common CLI patterns that spend tokens on intermedia
 | `docker inspect api | jq '.State.Health'` | `inspect` with `preset:"health"` or `fields` |
 | `docker exec c cmd | grep -v noisy` | `exec` with `exclude` |
 | `docker compose config` then scan YAML | `config` with `mode` |
+| `cd /repo && docker compose config --quiet` | `config` with `cwd`, `mode:"validate"` |
+| `cd /repo && docker compose config --services` | `config` with `cwd`, `mode:"services"` |
+| `cd /repo && docker build --target wine --tag enshrouded-wine-test .` | `passthrough` with `cwd`, `args:["build","--target","wine","--tag","enshrouded-wine-test","."]` |
+| Long shell loop for cold-volume startup checks across images | `verify_startup` with `images`, `probe_url`, `env`, `publish`, `volume_target` |
 | `docker events ...` in terminal then Ctrl+C | `events` with `since/until` window |
 
 ## Batch first

@@ -46,6 +46,7 @@ pub mod runner;
 pub mod stats;
 pub mod text;
 pub mod usage;
+pub mod verify_startup;
 
 pub use budget::{Budget, DEFAULT_MAX_BYTES, MAX_MAX_BYTES};
 pub use compose::{ComposeOutcome, ComposeRequest, Verb, compose};
@@ -63,6 +64,7 @@ pub use run::{RunOutcome, RunRequest, run};
 pub use runner::{CommandOutput, CommandRunner, ScriptedRunner, SystemRunner};
 pub use stats::{StatsOutcome, StatsRequest, stats};
 pub use usage::{UsageOutcome, UsageRequest, usage};
+pub use verify_startup::{VerifyImageResult, VerifyStartupOutcome, VerifyStartupRequest, verify_startup};
 
 /// What can go wrong before any container is touched.
 ///

@@ -30,6 +30,8 @@ pub enum Mode {
     Resources,
     /// Profiles, and which services belong to each.
     Profiles,
+    /// Parse/resolve only (`docker compose config --quiet`), for CI or quick health checks.
+    Validate,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -79,6 +81,30 @@ pub fn config(runner: &dyn CommandRunner, request: &ConfigRequest) -> Result<Con
 
     let mut rest = request.scope.args()?;
     rest.push("config".to_owned());
+    if request.mode == Mode::Validate {
+        rest.push("--quiet".to_owned());
+        if request.raw {
+            rest.push("--no-interpolate".to_owned());
+        }
+        rest.extend(request.services.iter().cloned());
+        let args = invoke::command(&request.invocation, rest)?;
+        let output = invoke::run(runner, &request.invocation, &args)?;
+        let command = format!("{} {}", request.invocation.bin(), args.join(" "));
+        let text = if output.ok() {
+            "[compose config: valid]\n".to_owned()
+        } else {
+            format!("[compose config: invalid ({})]\n", output.failure())
+        };
+        return Ok(ConfigOutcome {
+            text,
+            services: Vec::new(),
+            volumes: Vec::new(),
+            networks: Vec::new(),
+            command,
+            truncated: None,
+        });
+    }
+
     rest.push("--format".to_owned());
     rest.push("json".to_owned());
     if request.raw {
@@ -130,6 +156,7 @@ pub fn config(runner: &dyn CommandRunner, request: &ConfigRequest) -> Result<Con
         ),
         Mode::Resources => resources(&services, &volumes, &networks, &mut budget),
         Mode::Profiles => profiles(&services, &mut budget),
+        Mode::Validate => unreachable!("validate returns before config JSON parsing"),
     };
 
     let truncated = (budget.skipped() > 0)
@@ -560,6 +587,46 @@ network default
         assert_eq!(
             outcome.text,
             "(always)  db,wine\nops  backup\n[3 services, 3 volumes, 1 network]\n"
+        );
+    }
+
+    #[test]
+    fn validate_mode_checks_config_without_rendering_the_project() {
+        let runner = ScriptedRunner::new().with("docker compose -p ens config --quiet", "");
+        let outcome = config(
+            &runner,
+            &ConfigRequest {
+                scope: scope(),
+                mode: Mode::Validate,
+                ..ConfigRequest::default()
+            },
+        )
+        .expect("config");
+        assert_eq!(outcome.text, "[compose config: valid]\n");
+        assert!(outcome.services.is_empty());
+        assert!(outcome.volumes.is_empty());
+        assert!(outcome.networks.is_empty());
+    }
+
+    #[test]
+    fn validate_mode_returns_the_compose_error_line() {
+        let runner = ScriptedRunner::new().failing(
+            "docker compose -p ens config --quiet",
+            1,
+            "services.wine: unsupported option: 'restar'\n",
+        );
+        let outcome = config(
+            &runner,
+            &ConfigRequest {
+                scope: scope(),
+                mode: Mode::Validate,
+                ..ConfigRequest::default()
+            },
+        )
+        .expect("config");
+        assert_eq!(
+            outcome.text,
+            "[compose config: invalid (services.wine: unsupported option: 'restar')]\n"
         );
     }
 

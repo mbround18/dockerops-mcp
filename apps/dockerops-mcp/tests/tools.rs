@@ -30,6 +30,7 @@ fn every_tool_is_advertised_with_the_parameters_that_replace_a_pipeline() {
             "run",
             "stats",
             "usage",
+            "verify_startup",
         ]
     );
 
@@ -321,6 +322,64 @@ fn a_disk_question_is_answered_with_the_totals_line_docker_omits() {
         "Images  24G  3 active  18G reclaimable\n[24G total, 18G reclaimable (73%)]\n"
     );
     assert_eq!(result.structured()["reclaimable"], 19_542_101_196u64);
+}
+
+#[test]
+fn config_validate_mode_runs_compose_config_quiet() {
+    let fake = Fake::new().reply("compose config --quiet", "");
+    let mut server = fake.server();
+
+    let result = server.call("config", serde_json::json!({"mode": "validate"}));
+    assert!(!result.is_error(), "{}", result.text());
+    assert_eq!(result.text(), "[compose config: valid]\n");
+    assert!(
+        fake.calls()[0].contains("compose config --quiet"),
+        "{}",
+        fake.calls()[0]
+    );
+}
+
+#[test]
+fn verify_startup_runs_cold_volume_flow_and_cleans_up() {
+    let fake = Fake::new()
+        .reply("volume create verify-enshrouded-wine-test-run3-vol", "verify-enshrouded-wine-test-run3-vol\n")
+        .reply(
+            "run --detach --name verify-enshrouded-wine-test-run3 --env NAME=Verify --publish 3000:3000 --volume verify-enshrouded-wine-test-run3-vol:/home/steam/enshrouded enshrouded-wine-test",
+            "cid123\n",
+        )
+        .reply("logs --tail 80 verify-enshrouded-wine-test-run3", "booting\n")
+        .reply("rm -f verify-enshrouded-wine-test-run3", "verify-enshrouded-wine-test-run3\n")
+        .reply("volume rm -f verify-enshrouded-wine-test-run3-vol", "verify-enshrouded-wine-test-run3-vol\n");
+    let mut server = fake.server();
+
+    let result = server.call(
+        "verify_startup",
+        serde_json::json!({
+            "images": ["enshrouded-wine-test"],
+            "env": ["NAME=Verify"],
+            "publish": ["3000:3000"],
+            "volume_target": "/home/steam/enshrouded",
+            "probe_url": "http://127.0.0.1:3000/ready",
+            "run_id": "run3",
+            "initial_delay_seconds": 0,
+            "max_attempts": 0,
+            "cleanup": true,
+            "pause_between_images_seconds": 0
+        }),
+    );
+    assert!(!result.is_error(), "{}", result.text());
+    assert!(result.text().contains("FAILED on enshrouded-wine-test"));
+    let calls = fake.calls();
+    assert!(
+        calls.iter()
+            .any(|line| line.contains("volume create verify-enshrouded-wine-test-run3-vol")),
+        "{calls:?}"
+    );
+    assert!(
+        calls.iter()
+            .any(|line| line.contains("volume rm -f verify-enshrouded-wine-test-run3-vol")),
+        "{calls:?}"
+    );
 }
 
 #[test]

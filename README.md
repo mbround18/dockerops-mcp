@@ -2,7 +2,7 @@
 
 Token-efficient Docker + Docker Compose operations over MCP stdio.
 
-This server is built for agent workflows where raw `docker` output wastes context. It exposes twelve tools that return bounded, readable summaries with structured data attached.
+This server is built for agent workflows where raw `docker` output wastes context. It exposes thirteen tools that return bounded, readable summaries with structured data attached.
 
 ## What you get
 
@@ -27,6 +27,7 @@ This server is built for agent workflows where raw `docker` output wastes contex
 | `run` | Bounded `docker run` for one-off and detached containers. |
 | `exec` | One-shot container command with filtered output and exit status. |
 | `passthrough` | Long tail of docker/compose subcommands under guardrails. |
+| `verify_startup` | Cold-volume end-to-end startup verification for one or more images. |
 
 ## Install
 
@@ -85,6 +86,12 @@ Summarize compose resources:
 
 ```json
 {"tool":"config","arguments":{"files":["docker-compose.yml"],"mode":"resources"}}
+```
+
+Validate a compose project without rendering config YAML:
+
+```json
+{"tool":"config","arguments":{"cwd":"/path/to/project","mode":"validate"}}
 ```
 
 See `docs/guides/` for the full examples and invariants.

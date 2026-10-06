@@ -18,6 +18,7 @@ use dockerops_cli::{
     run::RunRequest,
     stats::StatsRequest,
     usage::UsageRequest,
+    verify_startup::VerifyStartupRequest,
 };
 use rmcp::{
     ErrorData, ServerHandler,
@@ -51,7 +52,7 @@ answers by date.
 reclaimable.
 - `config` — a compose project as it resolves: which image each service is really on, \
 what it publishes, what it mounts, what it waits for. Replaces reading several hundred \
-lines of `docker compose config`.
+lines of `docker compose config`. `mode: \"validate\"` runs the `--quiet` parse check.
 - `events` — a window of the daemon's event stream, both ends bounded. The restarts, OOM \
 kills and health transitions of the last fifteen minutes, in order.
 - `compose` — the lifecycle verbs: `up`, `down`, `start`, `stop`, `restart`, `kill`, \
@@ -66,6 +67,9 @@ pipeline throws away.
 - `passthrough` — any other docker or compose subcommand, as an argument list. This is \
 the rest of both CLIs — `cp`, `top`, `port`, `history`, `network inspect`, `volume \
 prune`, `buildx bake`, `swarm init` — under the same budget, deadline and rules.
+- `verify_startup` — cold-volume startup verification for one or more images: run \
+detached, poll a readiness URL, capture tail logs, clean up, and return pass/fail \
+evidence per image in one bounded call.
 
 Two habits make the difference:
 
@@ -297,8 +301,9 @@ pub struct ConfigParams {
     #[serde(default)]
     pub services: Vec<String>,
     /// `summary` (default: image, ports, mounts, dependencies per service), `services`
-    /// (names only), `images`, `resources` (volumes and networks, and what uses them) or
-    /// `profiles` (which services a `--profile` would bring up).
+    /// (names only), `images`, `resources` (volumes and networks, and what uses them),
+    /// `profiles` (which services a `--profile` would bring up), or `validate` (run
+    /// `docker compose config --quiet` and report only whether the config is valid).
     #[serde(default)]
     pub mode: Option<String>,
     /// Leave `${VAR}` unresolved, to see the file's own intent rather than this machine's
@@ -498,6 +503,49 @@ pub struct PassthroughParams {
     /// Cap on lines rendered. Defaults to 300.
     #[serde(default)]
     pub max_lines: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct VerifyStartupParams {
+    #[serde(flatten)]
+    pub engine: EngineParams,
+    /// Images to verify, in order. Each image is run in an isolated fresh volume.
+    pub images: Vec<String>,
+    /// `KEY=value` entries passed as `docker run --env`.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// `host:container` entries passed as `docker run --publish`.
+    #[serde(default)]
+    pub publish: Vec<String>,
+    /// Container path where the fresh test volume is mounted.
+    pub volume_target: String,
+    /// Readiness URL, for example `http://127.0.0.1:3000/ready`.
+    pub probe_url: String,
+    /// Delay before the first probe. Defaults to 30.
+    #[serde(default)]
+    pub initial_delay_seconds: Option<u64>,
+    /// Delay between probes while the container is still running. Defaults to 10.
+    #[serde(default)]
+    pub interval_seconds: Option<u64>,
+    /// Maximum probe attempts before timeout. Defaults to 120.
+    #[serde(default)]
+    pub max_attempts: Option<usize>,
+    /// `docker logs --tail` line count captured per image. Defaults to 80.
+    #[serde(default)]
+    pub log_tail_lines: Option<usize>,
+    /// Remove the test container and volume after each image run.
+    #[serde(default = "bool_true")]
+    pub cleanup: bool,
+    /// Delay between image runs when several images are verified in one call.
+    #[serde(default)]
+    pub pause_between_images_seconds: Option<u64>,
+    /// Optional deterministic id suffix for names/volumes (useful in CI/tests).
+    #[serde(default)]
+    pub run_id: Option<String>,
+}
+
+fn bool_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone)]
@@ -762,7 +810,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "config",
-        description = "A compose project as it actually resolves, rather than the merged document. `docker compose config` answers an important question — what the overrides, profiles and `.env` interpolation produced — with several hundred lines of YAML; this renders the facts people go looking for: which image each service is really on, what it publishes, what it mounts, what it waits for. `mode` switches to `services` (names only), `images`, `resources` (declared volumes and networks, and which services use them — including the ones nothing uses) or `profiles` (which services a `--profile` flag would bring up). `raw: true` leaves `${VAR}` unresolved. A compose file that does not parse comes back as the error line, which is usually the answer."
+        description = "A compose project as it actually resolves, rather than the merged document. `docker compose config` answers an important question — what the overrides, profiles and `.env` interpolation produced — with several hundred lines of YAML; this renders the facts people go looking for: which image each service is really on, what it publishes, what it mounts, what it waits for. `mode` switches to `services` (names only), `images`, `resources` (declared volumes and networks, and which services use them — including the ones nothing uses), `profiles` (which services a `--profile` flag would bring up), or `validate` (run `docker compose config --quiet` and return only valid/invalid). `raw: true` leaves `${VAR}` unresolved. A compose file that does not parse comes back as the error line, which is usually the answer."
     )]
     fn config(
         &self,
@@ -774,10 +822,11 @@ impl DockerOpsServer {
             Some("images") => Mode::Images,
             Some("resources" | "volumes" | "networks") => Mode::Resources,
             Some("profiles") => Mode::Profiles,
+            Some("validate" | "quiet") => Mode::Validate,
             Some(other) => {
                 return Ok(failed(dockerops_cli::Error::request(format!(
-                    "`mode` must be `summary`, `services`, `images`, `resources` or \
-                     `profiles`, not `{other}`"
+                    "`mode` must be `summary`, `services`, `images`, `resources`, \
+                     `profiles` or `validate`, not `{other}`"
                 ))));
             }
         };
@@ -964,6 +1013,42 @@ impl DockerOpsServer {
         };
 
         match dockerops_cli::passthrough(&dockerops_cli::SystemRunner, &request) {
+            Ok(outcome) => Ok(with_structured(outcome.text.clone(), &outcome)),
+            Err(err) => Ok(failed(err)),
+        }
+    }
+
+    #[tool(
+        name = "verify_startup",
+        description = "Cold-volume end-to-end startup validation for one or more images in one bounded call. For each image this tool creates an isolated fresh volume, runs the container detached with your env/publish settings, waits, probes a readiness URL (`probe_url`) up to `max_attempts`, captures a logs tail, and cleans up container+volume when asked. This replaces long shell loops that chain `docker run`, `curl`, `docker ps`, `docker logs`, and cleanup commands."
+    )]
+    fn verify_startup(
+        &self,
+        Parameters(params): Parameters<VerifyStartupParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if self.read_only {
+            return Ok(failed(dockerops_cli::Error::refused(
+                "this server is running read-only; `verify_startup` creates/removes containers and volumes.",
+            )));
+        }
+        let request = VerifyStartupRequest {
+            invocation: self.invocation(&params.engine),
+            images: params.images,
+            env: params.env,
+            publish: params.publish,
+            volume_target: params.volume_target,
+            probe_url: params.probe_url,
+            initial_delay_seconds: params.initial_delay_seconds,
+            interval_seconds: params.interval_seconds,
+            max_attempts: params.max_attempts,
+            log_tail_lines: params.log_tail_lines,
+            cleanup: params.cleanup,
+            pause_between_images_seconds: params.pause_between_images_seconds,
+            run_id: params.run_id,
+            max_bytes: self.budget(params.engine.max_bytes),
+        };
+
+        match dockerops_cli::verify_startup(&dockerops_cli::SystemRunner, &request) {
             Ok(outcome) => Ok(with_structured(outcome.text.clone(), &outcome)),
             Err(err) => Ok(failed(err)),
         }
