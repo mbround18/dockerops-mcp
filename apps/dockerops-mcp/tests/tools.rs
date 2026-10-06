@@ -17,7 +17,19 @@ fn every_tool_is_advertised_with_the_parameters_that_replace_a_pipeline() {
     names.sort_unstable();
     assert_eq!(
         names,
-        vec!["images", "inspect", "logs", "ps", "stats", "usage"]
+        vec![
+            "compose",
+            "config",
+            "events",
+            "exec",
+            "images",
+            "inspect",
+            "logs",
+            "passthrough",
+            "ps",
+            "stats",
+            "usage",
+        ]
     );
 
     let logs = listed.iter().find(|tool| tool["name"] == "logs").unwrap();
@@ -325,4 +337,85 @@ fn a_preset_that_does_not_exist_names_the_ones_that_do() {
         result.text()
     );
     assert!(fake.calls().is_empty());
+}
+
+#[test]
+fn the_lifecycle_verbs_that_throw_things_away_need_confirming() {
+    let fake = Fake::new().reply("compose -p ens down", "");
+    let mut server = fake.server();
+
+    let refused = server.call(
+        "compose",
+        serde_json::json!({"project": "ens", "verb": "down"}),
+    );
+    assert!(refused.is_error(), "{}", refused.text());
+    assert!(
+        refused.text().contains("confirm: true"),
+        "{}",
+        refused.text()
+    );
+    assert!(fake.calls().is_empty(), "nothing ran: {:?}", fake.calls());
+
+    let done = server.call(
+        "compose",
+        serde_json::json!({"project": "ens", "verb": "down", "confirm": true}),
+    );
+    assert!(!done.is_error(), "{}", done.text());
+    assert_eq!(fake.calls().len(), 1, "{:?}", fake.calls());
+}
+
+#[test]
+fn a_command_that_would_never_return_is_refused_with_the_bounded_form_named() {
+    let fake = Fake::new();
+    let mut server = fake.server();
+    for (args, expected) in [
+        (serde_json::json!(["attach", "api"]), "logs"),
+        (serde_json::json!(["logs", "-f", "api"]), "--follow"),
+        (serde_json::json!(["stats"]), "--no-stream"),
+        (serde_json::json!(["compose", "up"]), "--detach"),
+    ] {
+        let result = server.call("passthrough", serde_json::json!({"args": args}));
+        assert!(result.is_error(), "{args} ran: {}", result.text());
+        assert!(
+            result.text().contains(expected),
+            "{args} refusal did not name {expected}: {}",
+            result.text()
+        );
+    }
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+#[test]
+fn the_exec_pipeline_is_one_call_and_keeps_the_exit_status() {
+    // `docker exec ens-wine-1 enshrouded install | grep -v '^Update state'`, as one call.
+    let mut stdout = String::new();
+    for percent in 0..120 {
+        stdout.push_str(&format!(
+            "Update state (0x61) downloading, progress: {percent}.00\n"
+        ));
+    }
+    stdout.push_str("Error! App '2278520' state is 0x202 after update job.\n");
+    let fake = Fake::new().reply("exec", &stdout);
+    let mut server = fake.server();
+
+    let result = server.call(
+        "exec",
+        serde_json::json!({
+            "target": "ens-wine-1",
+            "argv": ["enshrouded", "install"],
+            "exclude": "^Update state",
+        }),
+    );
+    assert!(!result.is_error(), "{}", result.text());
+    assert_eq!(
+        result.text(),
+        "Error! App '2278520' state is 0x202 after update job.\n\
+         [1 line of 121 lines, 120 filtered, exit 0]\n"
+    );
+    // Both halves, as every tool here must: hosts disagree over which one they render.
+    assert_eq!(
+        result.structured()["text"].as_str().unwrap(),
+        result.text(),
+        "the rendered text must ship in the structured half too"
+    );
 }
