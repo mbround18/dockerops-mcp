@@ -1,0 +1,24 @@
+[package]
+name = "dockerops-mcp"
+description = "MCP server exposing batched, token-efficient Docker and Docker Compose operations over stdio."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dockerops-cli = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+rmcp = { version = "3.5", features = ["server", "macros", "transport-io"] }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
