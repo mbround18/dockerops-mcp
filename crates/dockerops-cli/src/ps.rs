@@ -15,7 +15,7 @@
 use serde::Serialize;
 
 use crate::{
-    Budget, Error, Result,
+    Budget, Result,
     container::{Container, State, parse_json_stream, render_ports},
     invoke::{self, ComposeScope, Invocation, safe_value},
     runner::CommandRunner,
@@ -77,13 +77,7 @@ pub fn ps(runner: &dyn CommandRunner, request: &PsRequest) -> Result<PsOutcome> 
         safe_value(service, "service")?;
     }
     for filter in &request.filter {
-        safe_value(filter, "filter")?;
-        if !filter.contains('=') {
-            return Err(Error::request(format!(
-                "filter `{filter}` is not a `key=value` expression; docker takes \
-                 `status=exited`, `health=unhealthy`, `name=api`, `label=env=prod`"
-            )));
-        }
+        invoke::check_filter(filter)?;
     }
 
     let compose = !request.scope.is_empty();

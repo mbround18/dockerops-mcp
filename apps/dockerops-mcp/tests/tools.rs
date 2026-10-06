@@ -15,7 +15,10 @@ fn every_tool_is_advertised_with_the_parameters_that_replace_a_pipeline() {
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
     names.sort_unstable();
-    assert_eq!(names, vec!["logs", "ps"]);
+    assert_eq!(
+        names,
+        vec!["images", "inspect", "logs", "ps", "stats", "usage"]
+    );
 
     let logs = listed.iter().find(|tool| tool["name"] == "logs").unwrap();
     let schema = logs["inputSchema"].to_string();
@@ -245,4 +248,81 @@ steamcmd: failed to install app 1203420 (0x202) ×6
 [1 target, 1 line, 5 repeats folded]
 "
     );
+}
+
+#[test]
+fn an_inspect_preset_turns_a_document_into_the_six_lines_meant_by_it() {
+    let document = serde_json::json!({
+        "Name": "/ens-wine-1",
+        "RestartCount": 3,
+        "State": {
+            "Status": "running",
+            "ExitCode": 0,
+            "OOMKilled": false,
+            "Health": {"Status": "unhealthy", "FailingStreak": 7, "Log": []},
+        },
+    })
+    .to_string();
+    let fake = Fake::new().reply("inspect", &format!("{document}\n"));
+    let mut server = fake.server();
+
+    let result = server.call(
+        "inspect",
+        serde_json::json!({"targets": ["ens-wine-1"], "preset": "health"}),
+    );
+
+    assert!(!result.is_error(), "{}", result.text());
+    assert_eq!(
+        result.text(),
+        "\
+#1 ens-wine-1
+State.Status: running
+State.Health.Status: unhealthy
+State.Health.FailingStreak: 7
+State.ExitCode: 0
+State.OOMKilled: false
+RestartCount: 3
+[not present: State.Health.Log.*.Output, State.Error]
+[1 target, 6 fields]
+"
+    );
+    // A Go template was not written, and no JSON reached the caller.
+    let call = &fake.calls()[0];
+    assert!(
+        call.contains("inspect --format {{json .}} ens-wine-1"),
+        "{call}"
+    );
+}
+
+#[test]
+fn a_disk_question_is_answered_with_the_totals_line_docker_omits() {
+    let fake = Fake::new().reply(
+        "system df",
+        "{\"Type\":\"Images\",\"TotalCount\":14,\"Active\":3,\"Size\":\"24.6GB\",\"Reclaimable\":\"18.2GB (73%)\"}\n",
+    );
+    let mut server = fake.server();
+
+    let result = server.call("usage", serde_json::json!({}));
+    assert_eq!(
+        result.text(),
+        "Images  24G  3 active  18G reclaimable\n[24G total, 18G reclaimable (73%)]\n"
+    );
+    assert_eq!(result.structured()["reclaimable"], 19_542_101_196u64);
+}
+
+#[test]
+fn a_preset_that_does_not_exist_names_the_ones_that_do() {
+    let fake = Fake::new();
+    let mut server = fake.server();
+    let result = server.call(
+        "inspect",
+        serde_json::json!({"targets": ["api"], "preset": "vibes"}),
+    );
+    assert!(result.is_error());
+    assert!(
+        result.text().contains("no preset `vibes`"),
+        "{}",
+        result.text()
+    );
+    assert!(fake.calls().is_empty());
 }

@@ -6,8 +6,12 @@
 
 use dockerops_cli::{
     ComposeScope, Invocation,
+    images::ImagesRequest,
+    inspect::{InspectRequest, Kind, Preset},
     logs::{Level, LogsRequest},
-    ps::{PsRequest, Sort},
+    ps::PsRequest,
+    stats::StatsRequest,
+    usage::UsageRequest,
 };
 use rmcp::{
     ErrorData, ServerHandler,
@@ -30,36 +34,35 @@ Containers and compose services alike; `project` or `files` routes the question 
 `exclude`, `context`, `level`, `since`/`until` and a `tail` that is always bounded. \
 Repeated lines fold into `… ×N`, and a container's stdout and stderr come back in the \
 order they were written.
+- `inspect` — the fields of the inspect document you asked for, by dotted path \
+(`State.Health.Status`, `Mounts.*.Destination`) or by preset (`health`, `env`, `mounts`, \
+`ports`, `network`, `image`, `labels`, `restart`, `entrypoint`, `limits`). Four hundred \
+lines of JSON become the six you meant.
+- `stats` — a resource snapshot, worst first. Never streams.
+- `images` — what is on disk, largest first, which is the question `docker images` \
+answers by date.
+- `usage` — `docker system df` with the totals line it leaves out, and what is actually \
+reclaimable.
 
 Two habits make the difference:
 
-1. **Batch.** One `logs` call naming four services costs one round trip. Four calls, or a \
-shell command joining four `docker logs` invocations, cost far more for the same bytes.
-2. **Filter in the call.** `level: \"error\"` or `grep` runs before the byte budget, so the \
-budget is spent on the lines that answer the question rather than on startup noise. Every \
-response is capped and says what it left out, so a reply that reports truncation is an \
-instruction to narrow the request, not to retry it unchanged.
+1. **Batch.** One `logs` call naming four services, or one `inspect` naming four \
+containers, costs one round trip. Four calls, or a shell command joining four invocations, \
+cost far more for the same bytes.
+2. **Filter in the call.** `level: \"error\"`, `grep`, a dotted `fields` path — all of it \
+runs before the byte budget, so the budget is spent on the lines that answer the question \
+rather than on startup noise. Every response is capped and says what it left out, so a \
+reply that reports truncation is an instruction to narrow the request, not to retry it \
+unchanged.
 
 Nothing here follows a stream: there is no `-f`. A tool call that does not terminate takes \
 the conversation with it, so the way to see what happened next is another call with \
-`since`. Every tool is read-only.";
+`since`. A failure that belongs to one target is one line of output next to the targets \
+that worked, never a failed call. Every tool is read-only.";
 
 /// Which Docker to talk to, and for how long. Shared by every tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
-pub struct DockerParams {
-    /// Compose project name (`-p`). Naming it, or `files`, routes the call through
-    /// `docker compose` instead of plain `docker`.
-    #[serde(default)]
-    pub project: Option<String>,
-    /// Compose files (`-f`), in order. Relative paths resolve against `cwd`.
-    #[serde(default)]
-    pub files: Vec<String>,
-    /// Compose profiles to enable (`--profile`).
-    #[serde(default)]
-    pub profiles: Vec<String>,
-    /// Compose env file (`--env-file`).
-    #[serde(default)]
-    pub env_file: Option<String>,
+pub struct EngineParams {
     /// Directory to run in — where a relative compose file is found. Defaults to the
     /// server's own working directory.
     #[serde(default)]
@@ -76,10 +79,29 @@ pub struct DockerParams {
     pub max_bytes: Option<usize>,
 }
 
+/// Naming any of these routes the call through `docker compose` instead of plain `docker`.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct ComposeParams {
+    /// Compose project name (`-p`).
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Compose files (`-f`), in order. Relative paths resolve against `cwd`.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Compose profiles to enable (`--profile`).
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    /// Compose env file (`--env-file`).
+    #[serde(default)]
+    pub env_file: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct PsParams {
     #[serde(flatten)]
-    pub docker: DockerParams,
+    pub engine: EngineParams,
+    #[serde(flatten)]
+    pub compose: ComposeParams,
     /// Include stopped containers. Off by default: `docker ps` without `-a` is the
     /// question people usually mean.
     #[serde(default)]
@@ -87,8 +109,8 @@ pub struct PsParams {
     /// Limit to these containers, or these compose services.
     #[serde(default)]
     pub services: Vec<String>,
-    /// Docker filters, as `key=value`: `status=exited`, `label=com.docker.compose.project=ens`,
-    /// `health=unhealthy`, `name=api`.
+    /// Docker filters, as `key=value`: `status=exited`, `health=unhealthy`, `name=api`,
+    /// `label=com.docker.compose.project=ens`.
     #[serde(default)]
     pub filter: Vec<String>,
     /// `name` (default), `state`, or `given` to keep Docker's own order.
@@ -102,7 +124,9 @@ pub struct PsParams {
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct LogsParams {
     #[serde(flatten)]
-    pub docker: DockerParams,
+    pub engine: EngineParams,
+    #[serde(flatten)]
+    pub compose: ComposeParams,
     /// Containers, or compose services when a `project`/`files` is given. Several in one
     /// call is the point of this tool. Empty, with a compose project, reads the whole
     /// project and attributes each line to the service that wrote it.
@@ -153,6 +177,87 @@ pub struct LogsParams {
     pub max_lines: Option<usize>,
 }
 
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct InspectParams {
+    #[serde(flatten)]
+    pub engine: EngineParams,
+    /// Containers, images, networks or volumes. Several in one call.
+    pub targets: Vec<String>,
+    /// `container`, `image`, `network` or `volume`. Omitted, Docker resolves a bare name
+    /// against containers first, which is occasionally the wrong guess.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Dotted paths into the inspect document: `State.Health.Status`,
+    /// `Mounts.*.Destination`, `Config.Env`, `NetworkSettings.Networks.*.IPAddress`. `*`
+    /// means every element of an array or every key of an object, and comes back as the
+    /// index or key it matched.
+    #[serde(default)]
+    pub fields: Vec<String>,
+    /// A named field set, used when `fields` is empty: `health`, `env`, `mounts`, `ports`,
+    /// `network`, `image`, `labels`, `restart`, `entrypoint`, `limits`, `summary`.
+    /// Defaults to `summary`.
+    #[serde(default)]
+    pub preset: Option<String>,
+    /// List the keys at each path instead of their values — how to find out what a
+    /// document holds before asking for any of it.
+    #[serde(default)]
+    pub keys: bool,
+    /// Cap on the characters of any one rendered value. Defaults to 240.
+    #[serde(default)]
+    pub max_value: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct StatsParams {
+    #[serde(flatten)]
+    pub engine: EngineParams,
+    /// Containers to measure. Empty means every running container.
+    #[serde(default)]
+    pub targets: Vec<String>,
+    /// `cpu` (default), `memory` or `name`.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// Cap on rows. Defaults to 40.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct ImagesParams {
+    #[serde(flatten)]
+    pub engine: EngineParams,
+    /// Only images matching these references: `ghcr.io/acme/*`, `postgres`.
+    #[serde(default)]
+    pub patterns: Vec<String>,
+    /// Docker filters, as `key=value`: `dangling=true`, `before=postgres:17`, `label=…`.
+    #[serde(default)]
+    pub filter: Vec<String>,
+    /// Include intermediate layers (`--all`).
+    #[serde(default)]
+    pub all: bool,
+    /// Include untagged images. On by default: they are usually where the disk went.
+    #[serde(default)]
+    pub dangling: Option<bool>,
+    /// `size` (default), `created` or `name`.
+    #[serde(default)]
+    pub sort: Option<String>,
+    /// Cap on rows. Defaults to 50.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct UsageParams {
+    #[serde(flatten)]
+    pub engine: EngineParams,
+    /// Ask Docker for the per-item detail as well (`docker system df -v`).
+    #[serde(default)]
+    pub detail: bool,
+    /// How many items to name per class when `detail` is set. Defaults to 5.
+    #[serde(default)]
+    pub top: Option<usize>,
+}
+
 #[derive(Debug, Clone)]
 pub struct DockerOpsServer {
     /// Server-wide default budget, from `--max-bytes`. A request may still name its own.
@@ -179,21 +284,21 @@ impl DockerOpsServer {
         }
     }
 
-    fn invocation(&self, params: &DockerParams) -> Invocation {
+    fn invocation(&self, engine: &EngineParams) -> Invocation {
         Invocation {
             docker_bin: self.docker_bin.clone(),
-            host: params.host.clone(),
-            cwd: params.cwd.clone().map(std::path::PathBuf::from),
-            timeout_seconds: params.timeout_seconds,
+            host: engine.host.clone(),
+            cwd: engine.cwd.clone().map(std::path::PathBuf::from),
+            timeout_seconds: engine.timeout_seconds,
         }
     }
 
-    fn scope(&self, params: &DockerParams) -> ComposeScope {
+    fn scope(&self, compose: &ComposeParams) -> ComposeScope {
         ComposeScope {
-            files: params.files.clone(),
-            project: params.project.clone(),
-            profiles: params.profiles.clone(),
-            env_file: params.env_file.clone(),
+            files: compose.files.clone(),
+            project: compose.project.clone(),
+            profiles: compose.profiles.clone(),
+            env_file: compose.env_file.clone(),
         }
     }
 
@@ -207,9 +312,9 @@ impl DockerOpsServer {
     )]
     fn ps(&self, Parameters(params): Parameters<PsParams>) -> Result<CallToolResult, ErrorData> {
         let sort = match params.sort.as_deref() {
-            None | Some("name") => Sort::Name,
-            Some("state") => Sort::State,
-            Some("given") => Sort::Given,
+            None | Some("name") => dockerops_cli::ps::Sort::Name,
+            Some("state") => dockerops_cli::ps::Sort::State,
+            Some("given") => dockerops_cli::ps::Sort::Given,
             Some(other) => {
                 return Ok(failed(dockerops_cli::Error::request(format!(
                     "`sort` must be `name`, `state` or `given`, not `{other}`"
@@ -217,14 +322,14 @@ impl DockerOpsServer {
             }
         };
         let request = PsRequest {
-            invocation: self.invocation(&params.docker),
-            scope: self.scope(&params.docker),
+            invocation: self.invocation(&params.engine),
+            scope: self.scope(&params.compose),
             all: params.all,
             services: params.services,
             filter: params.filter,
             sort,
             limit: params.limit,
-            max_bytes: self.budget(params.docker.max_bytes),
+            max_bytes: self.budget(params.engine.max_bytes),
         };
 
         match dockerops_cli::ps(&dockerops_cli::SystemRunner, &request) {
@@ -244,7 +349,7 @@ impl DockerOpsServer {
         let level = match params.level.as_deref() {
             None => None,
             Some("error") => Some(Level::Error),
-            Some("warn") | Some("warning") => Some(Level::Warn),
+            Some("warn" | "warning") => Some(Level::Warn),
             Some(other) => {
                 return Ok(failed(dockerops_cli::Error::request(format!(
                     "`level` must be `error` or `warn`, not `{other}`; use `grep` for anything else"
@@ -252,8 +357,8 @@ impl DockerOpsServer {
             }
         };
         let request = LogsRequest {
-            invocation: self.invocation(&params.docker),
-            scope: self.scope(&params.docker),
+            invocation: self.invocation(&params.engine),
+            scope: self.scope(&params.compose),
             targets: params.targets,
             tail: params.tail,
             since: params.since,
@@ -267,10 +372,148 @@ impl DockerOpsServer {
             collapse: params.collapse,
             head: params.head,
             max_lines: params.max_lines,
-            max_bytes: self.budget(params.docker.max_bytes),
+            max_bytes: self.budget(params.engine.max_bytes),
         };
 
         match dockerops_cli::logs(&dockerops_cli::SystemRunner, &request) {
+            Ok(outcome) => Ok(with_structured(outcome.text.clone(), &outcome)),
+            Err(err) => Ok(failed(err)),
+        }
+    }
+
+    #[tool(
+        name = "inspect",
+        description = "The fields of `docker inspect` you asked for, not the document. Takes dotted paths (`State.Health.Status`, `Mounts.*.Destination`, `Config.Env`) or a named preset (`health`, `env`, `mounts`, `ports`, `network`, `image`, `labels`, `restart`, `entrypoint`, `limits`, `summary`), over as many targets as you like in one call. A `*` matches every element or key and comes back as the one it matched; `keys: true` lists a level's shape instead of its contents, so an unfamiliar document can be explored a level at a time. A path that matches nothing is reported, because the alternative is reading a typo as an empty field. Replaces `docker inspect | jq` and hand-written Go templates."
+    )]
+    fn inspect(
+        &self,
+        Parameters(params): Parameters<InspectParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let kind = match params.kind.as_deref() {
+            None => Kind::Any,
+            Some("container") => Kind::Container,
+            Some("image") => Kind::Image,
+            Some("network") => Kind::Network,
+            Some("volume") => Kind::Volume,
+            Some(other) => {
+                return Ok(failed(dockerops_cli::Error::request(format!(
+                    "`kind` must be `container`, `image`, `network` or `volume`, not `{other}`"
+                ))));
+            }
+        };
+        let preset = match params.preset.as_deref() {
+            None => None,
+            Some(name) => match Preset::parse(name) {
+                Some(preset) => Some(preset),
+                None => {
+                    return Ok(failed(dockerops_cli::Error::request(format!(
+                        "no preset `{name}`; try `health`, `env`, `mounts`, `ports`, \
+                         `network`, `image`, `labels`, `restart`, `entrypoint`, `limits` \
+                         or `summary`, or name the paths in `fields`"
+                    ))));
+                }
+            },
+        };
+        let request = InspectRequest {
+            invocation: self.invocation(&params.engine),
+            targets: params.targets,
+            kind,
+            fields: params.fields,
+            preset,
+            keys: params.keys,
+            max_value: params.max_value,
+            max_bytes: self.budget(params.engine.max_bytes),
+        };
+
+        match dockerops_cli::inspect(&dockerops_cli::SystemRunner, &request) {
+            Ok(outcome) => Ok(with_structured(outcome.text.clone(), &outcome)),
+            Err(err) => Ok(failed(err)),
+        }
+    }
+
+    #[tool(
+        name = "stats",
+        description = "A resource snapshot: one line per container, worst first, memory as a share of its limit. Replaces `docker stats`, which is a live full-screen display that never returns — this one always passes `--no-stream`, because a tool call that does not terminate takes the conversation with it. Sort by `cpu` (default), `memory` or `name`; network and disk figures appear only when something has actually moved."
+    )]
+    fn stats(
+        &self,
+        Parameters(params): Parameters<StatsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let sort = match params.sort.as_deref() {
+            None | Some("cpu") => dockerops_cli::stats::Sort::Cpu,
+            Some("memory" | "mem") => dockerops_cli::stats::Sort::Memory,
+            Some("name") => dockerops_cli::stats::Sort::Name,
+            Some(other) => {
+                return Ok(failed(dockerops_cli::Error::request(format!(
+                    "`sort` must be `cpu`, `memory` or `name`, not `{other}`"
+                ))));
+            }
+        };
+        let request = StatsRequest {
+            invocation: self.invocation(&params.engine),
+            targets: params.targets,
+            sort,
+            limit: params.limit,
+            max_bytes: self.budget(params.engine.max_bytes),
+        };
+
+        match dockerops_cli::stats(&dockerops_cli::SystemRunner, &request) {
+            Ok(outcome) => Ok(with_structured(outcome.text.clone(), &outcome)),
+            Err(err) => Ok(failed(err)),
+        }
+    }
+
+    #[tool(
+        name = "images",
+        description = "What is on disk, largest first — the question `docker images` answers by creation date. One line per image: reference, size, age. `patterns` and Docker's own `key=value` `filter`s narrow it, `dangling: false` hides untagged images once you have seen them. Sizes are parsed to bytes so the sort is numeric rather than alphabetical, and the footer totals what was listed."
+    )]
+    fn images(
+        &self,
+        Parameters(params): Parameters<ImagesParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let sort = match params.sort.as_deref() {
+            None | Some("size") => dockerops_cli::images::Sort::Size,
+            Some("created") => dockerops_cli::images::Sort::Created,
+            Some("name") => dockerops_cli::images::Sort::Name,
+            Some(other) => {
+                return Ok(failed(dockerops_cli::Error::request(format!(
+                    "`sort` must be `size`, `created` or `name`, not `{other}`"
+                ))));
+            }
+        };
+        let request = ImagesRequest {
+            invocation: self.invocation(&params.engine),
+            patterns: params.patterns,
+            filter: params.filter,
+            all: params.all,
+            dangling: params.dangling,
+            sort,
+            limit: params.limit,
+            max_bytes: self.budget(params.engine.max_bytes),
+        };
+
+        match dockerops_cli::images(&dockerops_cli::SystemRunner, &request) {
+            Ok(outcome) => Ok(with_structured(outcome.text.clone(), &outcome)),
+            Err(err) => Ok(failed(err)),
+        }
+    }
+
+    #[tool(
+        name = "usage",
+        description = "Where the disk went: `docker system df` with the totals line it leaves out and the reclaimable share worked out. Four rows — images, containers, volumes, build cache — then the total and what fraction of it you can have back, which is the number a decision gets made on. `detail` asks Docker for the per-item breakdown as well."
+    )]
+    fn usage(
+        &self,
+        Parameters(params): Parameters<UsageParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let request = UsageRequest {
+            invocation: self.invocation(&params.engine),
+            detail: params.detail,
+            top: params.top,
+            max_bytes: self.budget(params.engine.max_bytes),
+        };
+
+        match dockerops_cli::usage(&dockerops_cli::SystemRunner, &request) {
             Ok(outcome) => Ok(with_structured(outcome.text.clone(), &outcome)),
             Err(err) => Ok(failed(err)),
         }

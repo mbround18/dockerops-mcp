@@ -31,18 +31,26 @@
 
 pub mod budget;
 pub mod container;
+pub mod images;
+pub mod inspect;
 pub mod invoke;
 pub mod logs;
 pub mod ps;
 pub mod runner;
+pub mod stats;
 pub mod text;
+pub mod usage;
 
 pub use budget::{Budget, DEFAULT_MAX_BYTES, MAX_MAX_BYTES};
 pub use container::{Container, Port, State, Status};
+pub use images::{ImagesOutcome, ImagesRequest, images};
+pub use inspect::{InspectOutcome, InspectRequest, inspect};
 pub use invoke::{ComposeScope, Invocation};
 pub use logs::{Level, LogsOutcome, LogsRequest, logs};
 pub use ps::{PsOutcome, PsRequest, ps};
 pub use runner::{CommandOutput, CommandRunner, ScriptedRunner, SystemRunner};
+pub use stats::{StatsOutcome, StatsRequest, stats};
+pub use usage::{UsageOutcome, UsageRequest, usage};
 
 /// What can go wrong before any container is touched.
 ///

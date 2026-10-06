@@ -139,6 +139,19 @@ pub fn safe_value(value: &str, what: &str) -> Result<()> {
 
 /// Run an assembled command line, turning "docker is not installed" into an error a
 /// caller can act on rather than an I/O code.
+/// Docker's filters are all `key=value`. Checking that here means every tool refuses a
+/// malformed one the same way, before it reaches a CLI that would answer with its usage.
+pub fn check_filter(filter: &str) -> Result<()> {
+    safe_value(filter, "filter")?;
+    if !filter.contains('=') {
+        return Err(Error::request(format!(
+            "filter `{filter}` is not a `key=value` expression; docker takes \
+             `status=exited`, `health=unhealthy`, `name=api`, `label=env=prod`"
+        )));
+    }
+    Ok(())
+}
+
 pub fn run(
     runner: &dyn CommandRunner,
     invocation: &Invocation,
