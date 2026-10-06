@@ -32,13 +32,15 @@
 pub mod budget;
 pub mod container;
 pub mod invoke;
+pub mod logs;
 pub mod ps;
 pub mod runner;
 pub mod text;
 
 pub use budget::{Budget, DEFAULT_MAX_BYTES, MAX_MAX_BYTES};
-pub use invoke::{ComposeScope, Invocation};
 pub use container::{Container, Port, State, Status};
+pub use invoke::{ComposeScope, Invocation};
+pub use logs::{Level, LogsOutcome, LogsRequest, logs};
 pub use ps::{PsOutcome, PsRequest, ps};
 pub use runner::{CommandOutput, CommandRunner, ScriptedRunner, SystemRunner};
 
@@ -62,9 +64,7 @@ pub enum Error {
     Refused { detail: String },
 
     /// The request would change or destroy state and did not say so out loud.
-    #[error(
-        "`{verb}` {effect}. Re-send with `confirm: true` if that is what you want. {hint}"
-    )]
+    #[error("`{verb}` {effect}. Re-send with `confirm: true` if that is what you want. {hint}")]
     NeedsConfirmation {
         verb: String,
         effect: String,

@@ -53,7 +53,10 @@ impl CommandOutput {
 
     /// Non-empty stdout lines, which is the shape every `--format` call comes back in.
     pub fn stdout_lines(&self) -> impl Iterator<Item = &str> {
-        self.stdout.lines().map(str::trim_end).filter(|l| !l.is_empty())
+        self.stdout
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.is_empty())
     }
 
     /// The most useful line of a failure. Docker puts the reason last and prefixes it with
@@ -66,8 +69,8 @@ impl CommandOutput {
             .stderr
             .lines()
             .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .next_back()
+            .rev()
+            .find(|l| !l.is_empty())
             .or_else(|| self.stdout.lines().map(str::trim).find(|l| !l.is_empty()))
             .unwrap_or("no output");
         detail

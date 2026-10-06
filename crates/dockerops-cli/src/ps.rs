@@ -319,11 +319,7 @@ mod tests {
             },
         )
         .expect("listed");
-        let names: Vec<&str> = outcome
-            .containers
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect();
+        let names: Vec<&str> = outcome.containers.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["ens-coldtest", "ens-db-1", "ens-wine-1"]);
     }
 

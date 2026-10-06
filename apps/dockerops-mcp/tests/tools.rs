@@ -1,0 +1,248 @@
+//! End-to-end: the tools as an MCP client sees them, against a `docker` that is a script.
+
+mod harness;
+
+use harness::{Fake, stamped};
+
+#[test]
+fn every_tool_is_advertised_with_the_parameters_that_replace_a_pipeline() {
+    let fake = Fake::new();
+    let mut server = fake.server();
+    let tools = server.tools();
+    let listed = tools["tools"].as_array().expect("tools");
+    let mut names: Vec<&str> = listed
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, vec!["logs", "ps"]);
+
+    let logs = listed.iter().find(|tool| tool["name"] == "logs").unwrap();
+    let schema = logs["inputSchema"].to_string();
+    for parameter in [
+        "targets",
+        "tail",
+        "since",
+        "until",
+        "grep",
+        "exclude",
+        "level",
+        "context",
+        "collapse",
+        "max_lines",
+        "max_bytes",
+        "project",
+        "files",
+    ] {
+        assert!(
+            schema.contains(parameter),
+            "`{parameter}` missing from the logs schema: {schema}"
+        );
+    }
+    // There is no follow mode, and advertising one would be a promise the server cannot
+    // keep: a streaming tool call never returns.
+    assert!(!schema.contains("follow"), "{schema}");
+    assert!(
+        server.instructions.contains("Prefer these tools over"),
+        "the server tells the client what it is for: {}",
+        server.instructions
+    );
+}
+
+#[test]
+fn one_logs_call_replaces_the_pipeline_it_was_written_for() {
+    // `docker compose logs api 2>&1 | grep -iE 'error|panic' | tail -40`, as one call.
+    let fake = Fake::new().reply(
+        "logs",
+        &format!(
+            "{}{}{}",
+            stamped("12:04:10", "GET /healthz 200"),
+            stamped("12:04:11", "ERROR failed to reach db: connection refused"),
+            stamped("12:04:12", "GET /healthz 200"),
+        ),
+    );
+    let mut server = fake.server();
+
+    let result = server.call(
+        "logs",
+        serde_json::json!({"targets": ["api"], "level": "error"}),
+    );
+
+    assert!(!result.is_error(), "{}", result.text());
+    assert_eq!(
+        result.text(),
+        "\
+#1 api 1/3 (2 filtered)
+ERROR failed to reach db: connection refused
+[1 target, 1 line, 2 filtered out]
+"
+    );
+    assert_eq!(result.structured()["lines_shown"], 1);
+    assert_eq!(result.structured()["targets"][0]["filtered_out"], 2);
+    // Timestamps were fetched to merge the streams and then paid for by nobody.
+    assert!(
+        fake.calls()[0].contains("--timestamps"),
+        "{:?}",
+        fake.calls()
+    );
+}
+
+#[test]
+fn both_halves_of_a_response_carry_the_rendered_text() {
+    // Hosts disagree about which half they display: Claude Code renders
+    // `structuredContent` and drops the text content, others do the reverse. A tool that
+    // fills in only one answers half its callers with metadata and no content. That
+    // regression shipped once in the sibling server; this is why it cannot ship here.
+    let fake = Fake::new()
+        .reply("ps", "{\"Names\":\"api\",\"State\":\"running\",\"Status\":\"Up 3 hours\",\"Image\":\"api:1\",\"Ports\":\"\"}\n")
+        .reply("logs", &stamped("12:04:11", "ready"));
+    let mut server = fake.server();
+
+    for (tool, arguments) in [
+        ("ps", serde_json::json!({})),
+        ("logs", serde_json::json!({"targets": ["api"]})),
+    ] {
+        let result = server.call(tool, arguments);
+        assert!(!result.is_error(), "{tool}: {}", result.text());
+        let carried = result.structured()["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{tool} left its text out of the structured copy"));
+        assert_eq!(
+            carried,
+            result.text(),
+            "{tool}: the two halves of the response disagree"
+        );
+        assert!(!carried.is_empty(), "{tool} rendered nothing");
+    }
+}
+
+#[test]
+fn several_targets_and_one_missing_container_are_still_one_answer() {
+    let fake = Fake::new()
+        .reply(
+            "logs --timestamps --tail 80 api",
+            &stamped("12:04:11", "ready"),
+        )
+        .fail(
+            "logs --timestamps --tail 80 gone",
+            "Error response from daemon: No such container: gone\n",
+        );
+    let mut server = fake.server();
+
+    let result = server.call("logs", serde_json::json!({"targets": ["api", "gone"]}));
+
+    assert!(!result.is_error(), "{}", result.text());
+    assert_eq!(
+        result.text(),
+        "\
+#1 api 1/1
+ready
+#2 gone — No such container: gone
+[2 targets, 1 line]
+"
+    );
+}
+
+#[test]
+fn the_two_container_streams_come_back_in_order() {
+    let fake = Fake::new().reply_both(
+        "logs",
+        &format!(
+            "{}{}",
+            stamped("12:04:11", "starting"),
+            stamped("12:04:14", "still here")
+        ),
+        &stamped("12:04:12", "cannot reach db"),
+    );
+    let mut server = fake.server();
+
+    let result = server.call("logs", serde_json::json!({"targets": ["api"]}));
+    assert_eq!(
+        result.text(),
+        "\
+#1 api 3/3
+starting
+cannot reach db
+still here
+[1 target, 3 lines]
+"
+    );
+    assert_eq!(result.structured()["targets"][0]["stderr_lines"], 1);
+}
+
+#[test]
+fn a_compose_project_routes_through_compose_without_being_asked_twice() {
+    let fake = Fake::new().reply(
+        "compose",
+        "{\"Name\":\"ens-wine-1\",\"Service\":\"wine\",\"State\":\"running\",\"Status\":\"Up 3 hours (unhealthy)\",\"Image\":\"ens:1.4\",\"Publishers\":[]}\n",
+    );
+    let mut server = fake.server();
+
+    let result = server.call(
+        "ps",
+        serde_json::json!({"project": "ens", "files": ["docker-compose.yml"]}),
+    );
+
+    assert!(!result.is_error(), "{}", result.text());
+    assert_eq!(
+        result.text(),
+        "\
+ens-wine-1  up 3h unhealthy  ens:1.4  -
+[1 container: 1 up]
+"
+    );
+    let call = &fake.calls()[0];
+    assert!(
+        call.contains("compose -f docker-compose.yml -p ens ps"),
+        "{call}"
+    );
+}
+
+#[test]
+fn a_bad_request_comes_back_as_a_readable_tool_error() {
+    let fake = Fake::new();
+    let mut server = fake.server();
+
+    let result = server.call("logs", serde_json::json!({}));
+    assert!(result.is_error());
+    assert!(
+        result.text().contains("name at least one container"),
+        "{}",
+        result.text()
+    );
+
+    let result = server.call(
+        "logs",
+        serde_json::json!({"targets": ["api"], "level": "spicy"}),
+    );
+    assert!(result.is_error());
+    assert!(
+        result.text().contains("must be `error` or `warn`"),
+        "{}",
+        result.text()
+    );
+
+    // Nothing was run on the way to either refusal.
+    assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+}
+
+#[test]
+fn a_crash_loop_costs_one_line_and_a_count() {
+    let repeated = stamped(
+        "12:04:11",
+        "steamcmd: failed to install app 1203420 (0x202)",
+    )
+    .repeat(6);
+    let fake = Fake::new().reply("logs", &repeated);
+    let mut server = fake.server();
+
+    let result = server.call("logs", serde_json::json!({"targets": ["wine"]}));
+    assert_eq!(
+        result.text(),
+        "\
+#1 wine 1/6
+steamcmd: failed to install app 1203420 (0x202) ×6
+[1 target, 1 line, 5 repeats folded]
+"
+    );
+}
