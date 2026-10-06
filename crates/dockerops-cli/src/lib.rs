@@ -30,12 +30,16 @@
 //! parameters and translates them. Nothing here needs a daemon to be tested.
 
 pub mod budget;
+pub mod container;
 pub mod invoke;
+pub mod ps;
 pub mod runner;
 pub mod text;
 
 pub use budget::{Budget, DEFAULT_MAX_BYTES, MAX_MAX_BYTES};
 pub use invoke::{ComposeScope, Invocation};
+pub use container::{Container, Port, State, Status};
+pub use ps::{PsOutcome, PsRequest, ps};
 pub use runner::{CommandOutput, CommandRunner, ScriptedRunner, SystemRunner};
 
 /// What can go wrong before any container is touched.
