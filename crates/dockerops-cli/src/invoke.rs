@@ -152,6 +152,22 @@ pub fn check_filter(filter: &str) -> Result<()> {
     Ok(())
 }
 
+/// Compile a caller's filter, with a message that says which parameter was wrong.
+pub fn matcher(
+    pattern: Option<&str>,
+    ignore_case: bool,
+    what: &str,
+) -> Result<Option<regex::Regex>> {
+    pattern
+        .map(|pattern| {
+            regex::RegexBuilder::new(pattern)
+                .case_insensitive(ignore_case)
+                .build()
+                .map_err(|err| Error::request(format!("{what} `{pattern}` is not a regex: {err}")))
+        })
+        .transpose()
+}
+
 pub fn run(
     runner: &dyn CommandRunner,
     invocation: &Invocation,

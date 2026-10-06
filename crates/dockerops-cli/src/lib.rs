@@ -30,11 +30,16 @@
 //! parameters and translates them. Nothing here needs a daemon to be tested.
 
 pub mod budget;
+pub mod compose;
+pub mod config;
 pub mod container;
+pub mod events;
+pub mod exec;
 pub mod images;
 pub mod inspect;
 pub mod invoke;
 pub mod logs;
+pub mod passthrough;
 pub mod ps;
 pub mod runner;
 pub mod stats;
@@ -42,11 +47,16 @@ pub mod text;
 pub mod usage;
 
 pub use budget::{Budget, DEFAULT_MAX_BYTES, MAX_MAX_BYTES};
+pub use compose::{ComposeOutcome, ComposeRequest, Verb, compose};
+pub use config::{ConfigOutcome, ConfigRequest, config};
 pub use container::{Container, Port, State, Status};
+pub use events::{EventsOutcome, EventsRequest, events};
+pub use exec::{ExecOutcome, ExecRequest, exec};
 pub use images::{ImagesOutcome, ImagesRequest, images};
 pub use inspect::{InspectOutcome, InspectRequest, inspect};
 pub use invoke::{ComposeScope, Invocation};
 pub use logs::{Level, LogsOutcome, LogsRequest, logs};
+pub use passthrough::{Class, PassthroughOutcome, PassthroughRequest, passthrough};
 pub use ps::{PsOutcome, PsRequest, ps};
 pub use runner::{CommandOutput, CommandRunner, ScriptedRunner, SystemRunner};
 pub use stats::{StatsOutcome, StatsRequest, stats};
