@@ -28,8 +28,9 @@ struct Cli {
     #[arg(long, env = "DOCKEROPS_MCP_DOCKER_BIN")]
     docker_bin: Option<String>,
 
-    /// Refuse every tool that changes state, leaving only the read-only ones. For a
-    /// session that should be able to look at containers and nothing else.
+    /// Refuse every tool that changes state (`compose`, `run`, `exec`, and mutating
+    /// passthrough calls), leaving only read-only tools. For a session that should be
+    /// able to look at containers and nothing else.
     #[arg(long, env = "DOCKEROPS_MCP_READ_ONLY")]
     read_only: bool,
 }

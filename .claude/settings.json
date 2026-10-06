@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk git --no-pager status --short --branch)",
+      "Bash(rtk cargo build --workspace)",
+      "Bash(rtk cargo test --workspace)",
+      "Bash(rtk cargo clippy --workspace --all-targets -- -D warnings)",
+      "Bash(rtk cargo fmt --all --check)",
+      "Bash(rtk make build)",
+      "Bash(rtk make test)",
+      "Bash(rtk make lint)",
+      "Bash(rtk make install)",
+      "Bash(rtk docker ps)",
+      "Bash(rtk docker compose ps)",
+      "Bash(rtk docker logs *)",
+      "Bash(rtk docker inspect *)",
+      "Bash(rtk docker events *)",
+      "Bash(rtk docker exec *)",
+      "Bash(rtk docker image ls *)",
+      "Bash(rtk docker system df *)"
+    ],
+    "deny": [
+      "Bash(git reset --hard*)",
+      "Bash(git checkout -- *)",
+      "Bash(rtk git reset --hard*)",
+      "Bash(rtk git checkout -- *)",
+      "Bash(rm -rf /)",
+      "Bash(rtk rm -rf /)"
+    ]
+  }
+}

@@ -15,6 +15,7 @@ use dockerops_cli::{
     logs::{Level, LogsRequest},
     passthrough::PassthroughRequest,
     ps::PsRequest,
+    run::RunRequest,
     stats::StatsRequest,
     usage::UsageRequest,
 };
@@ -56,6 +57,9 @@ kills and health transitions of the last fifteen minutes, in order.
 - `compose` — the lifecycle verbs: `up`, `down`, `start`, `stop`, `restart`, `kill`, \
 `build`, `pull`, `create`, `rm`. `up` is always detached, and forty lines of progress \
 come back as one line per outcome.
+- `run` — a bounded `docker run` for one-off or detached containers. It carries the same \
+line and byte caps as the other tools, defaults to ephemeral runs, and returns the \
+container id on detached starts.
 - `exec` — a command in a container, with the filtering you were going to pipe it \
 through: `grep`, `exclude`, `max_lines`. The exit status comes back attached, which a \
 pipeline throws away.
@@ -83,8 +87,7 @@ by name, and says which tool answers the same question.
 A failure that belongs to one target is one line of output next to the targets that \
 worked, never a failed call. Anything that destroys state — `compose down`, `rm`, `rmi`, \
 `prune`, `kill` — needs `confirm: true`, and the refusal says what would have gone; ask a \
-read tool what exists before confirming. The first six tools are read-only whatever the \
-server is started with.";
+read tool what exists before confirming. The read tools are unaffected by `--read-only`.";
 
 /// Which Docker to talk to, and for how long. Shared by every tool.
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -416,6 +419,58 @@ pub struct ExecParams {
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct RunParams {
+    #[serde(flatten)]
+    pub engine: EngineParams,
+    /// Image reference to run (`hello-world`, `postgres:17`, `ghcr.io/acme/api:sha`).
+    pub image: String,
+    /// Command and arguments after the image.
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// `--name`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `--user`.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// `--workdir`.
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// `--env` entries, as `KEY=value`.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// `--publish` entries (`8080:80`, `127.0.0.1:5432:5432`).
+    #[serde(default)]
+    pub publish: Vec<String>,
+    /// `--volume` entries (`host:container[:mode]`).
+    #[serde(default)]
+    pub volume: Vec<String>,
+    /// `--network`.
+    #[serde(default)]
+    pub network: Option<String>,
+    /// `--detach` (`-d`).
+    #[serde(default)]
+    pub detach: bool,
+    /// `--rm`. Defaults to true for one-off runs when not set.
+    #[serde(default)]
+    pub rm: Option<bool>,
+    /// Keep only output lines matching this regex.
+    #[serde(default)]
+    pub grep: Option<String>,
+    /// Drop output lines matching this regex, applied after `grep`.
+    #[serde(default)]
+    pub exclude: Option<String>,
+    #[serde(default)]
+    pub ignore_case: bool,
+    /// Keep the first lines rather than the last.
+    #[serde(default)]
+    pub head: bool,
+    /// Cap on lines rendered. Defaults to 200.
+    #[serde(default)]
+    pub max_lines: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct PassthroughParams {
     #[serde(flatten)]
     pub engine: EngineParams,
@@ -451,8 +506,8 @@ pub struct DockerOpsServer {
     default_max_bytes: Option<usize>,
     /// Docker binary, from `--docker-bin`, for a podman shim or an unusual install.
     docker_bin: Option<String>,
-    /// From `--read-only`: `compose`, `exec` and anything but a read through
-    /// `passthrough` refuse outright. The six read tools are unaffected.
+    /// From `--read-only`: `compose`, `run`, `exec` and anything but a read through
+    /// `passthrough` refuse outright. The read tools are unaffected.
     read_only: bool,
 }
 
@@ -807,6 +862,43 @@ impl DockerOpsServer {
         };
 
         match dockerops_cli::compose(&dockerops_cli::SystemRunner, &request) {
+            Ok(outcome) => Ok(with_structured(outcome.text.clone(), &outcome)),
+            Err(err) => Ok(failed(err)),
+        }
+    }
+
+    #[tool(
+        name = "run",
+        description = "A bounded `docker run` for one-off and detached starts. Use this instead of passthrough for `docker run`: arguments are structured (`image`, `command`, `env`, `publish`, `volume`), output is line- and byte-capped, and detached starts return the container id in structured output. Safety rail: set `detach: true` for background containers or keep `rm: true` for ephemeral foreground runs."
+    )]
+    fn run(&self, Parameters(params): Parameters<RunParams>) -> Result<CallToolResult, ErrorData> {
+        if self.read_only {
+            return Ok(failed(dockerops_cli::Error::refused(
+                "this server is running read-only; `run` starts new containers and changes state.",
+            )));
+        }
+        let request = RunRequest {
+            invocation: self.invocation(&params.engine),
+            image: params.image,
+            command: params.command,
+            name: params.name,
+            user: params.user,
+            workdir: params.workdir,
+            env: params.env,
+            publish: params.publish,
+            volume: params.volume,
+            network: params.network,
+            detach: params.detach,
+            rm: params.rm.unwrap_or(true),
+            grep: params.grep,
+            exclude: params.exclude,
+            ignore_case: params.ignore_case,
+            head: params.head,
+            max_lines: params.max_lines,
+            max_bytes: self.budget(params.engine.max_bytes),
+        };
+
+        match dockerops_cli::run(&dockerops_cli::SystemRunner, &request) {
             Ok(outcome) => Ok(with_structured(outcome.text.clone(), &outcome)),
             Err(err) => Ok(failed(err)),
         }

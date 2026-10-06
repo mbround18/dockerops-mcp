@@ -27,6 +27,7 @@ fn every_tool_is_advertised_with_the_parameters_that_replace_a_pipeline() {
             "logs",
             "passthrough",
             "ps",
+            "run",
             "stats",
             "usage",
         ]
@@ -418,4 +419,18 @@ fn the_exec_pipeline_is_one_call_and_keeps_the_exit_status() {
         result.text(),
         "the rendered text must ship in the structured half too"
     );
+}
+
+#[test]
+fn run_defaults_to_rm_for_one_off_containers() {
+    let fake = Fake::new().reply("run --rm hello-world", "Hello from Docker!\n");
+    let mut server = fake.server();
+
+    let result = server.call("run", serde_json::json!({"image": "hello-world"}));
+    assert!(!result.is_error(), "{}", result.text());
+    assert_eq!(
+        result.text(),
+        "Hello from Docker!\n[run hello-world, 1 line, exit 0]\n"
+    );
+    assert!(fake.calls()[0].contains("run --rm hello-world"));
 }
