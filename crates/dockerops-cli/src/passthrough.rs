@@ -25,6 +25,10 @@ use crate::{
 
 pub const DEFAULT_MAX_LINES: usize = 300;
 
+/// Cap on `stdin`. Enough for a SQL script or a config file; an image tarball belongs in a
+/// file that `load -i` names.
+pub const MAX_STDIN_BYTES: usize = 1024 * 1024;
+
 /// What a subcommand does to the world. Decided from the argv before anything runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -70,6 +74,9 @@ pub struct PassthroughRequest {
     /// Cap on lines rendered. Defaults to 300.
     pub max_lines: Option<usize>,
     pub max_bytes: Option<usize>,
+    /// Written to the command's stdin, which is then closed. Without it stdin is empty, so
+    /// `-i` reads end-of-file at once instead of waiting.
+    pub stdin: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,8 +121,36 @@ pub fn passthrough(
         )));
     }
 
+    if request
+        .stdin
+        .as_ref()
+        .is_some_and(|input| input.len() > MAX_STDIN_BYTES)
+    {
+        return Err(Error::request(format!(
+            "`stdin` is over {MAX_STDIN_BYTES} bytes; write it to a file and name the file"
+        )));
+    }
+
     refuse_if_endless(args)?;
     let class = classify(args);
+    let compose = !request.scope.is_empty() || words(args).0 == "compose";
+    let terminal = Terminal::of(args, compose);
+    if request.stdin.is_some() && terminal.is_some_and(|t| !t.interactive) {
+        return Err(Error::request(format!(
+            "`stdin` was given but `{}` was not asked for `-i`, so docker would not \
+             pass it on; add `-i`",
+            phrase(args)
+        )));
+    }
+    // `-t` with `-i` fails outright when stdin is not a terminal, which here it never is.
+    // Keeping stdin is what such a call usually wanted, so the terminal is what goes.
+    let dropped_tty = terminal.is_some_and(|t| t.interactive && t.tty);
+    let tty = terminal.is_some_and(|t| t.tty) && !dropped_tty;
+    let args = &if dropped_tty {
+        drop_tty(args, compose)
+    } else {
+        args.clone()
+    };
 
     if request.read_only && class != Class::Read {
         return Err(Error::refused(format!(
@@ -140,8 +175,16 @@ pub fn passthrough(
     rest.extend(args.iter().cloned());
 
     let line = invoke::command(&request.invocation, rest)?;
-    let output = invoke::run(runner, &request.invocation, &line)?;
+    let mut output =
+        invoke::run_with_stdin(runner, &request.invocation, &line, request.stdin.as_deref())?;
     let command = format!("{} {}", request.invocation.bin(), line.join(" "));
+
+    // A terminal gets carriage returns and escape sequences that a pipe would not have,
+    // and both would be spent from the budget as if they were text.
+    if tty {
+        output.stdout = strip_terminal(&output.stdout);
+        output.stderr = strip_terminal(&output.stderr);
+    }
 
     // Which stream a docker subcommand uses is not worth modelling: `inspect` writes JSON
     // to stdout, `pull` writes progress to stderr, `cp` writes nothing at all.
@@ -207,6 +250,9 @@ pub fn passthrough(
     }
     if let Some(note) = &truncated {
         footer.push_str(&format!(", {note}"));
+    }
+    if dropped_tty {
+        footer.push_str(", `-t` dropped: stdin is not a terminal");
     }
     footer.push_str(&if output.timed_out {
         format!(
@@ -274,13 +320,6 @@ fn refuse_if_endless(args: &[String]) -> Result<()> {
         _ => first.clone(),
     };
 
-    if has_flag(args, "--interactive", Some('i')) || has_flag(args, "--tty", Some('t')) {
-        return Err(Error::refused(
-            "`-i`/`-t` attach a terminal that nothing is sitting at; drop them. \
-             For a command in a container use the `exec` tool, which never allocates one",
-        ));
-    }
-
     let follow = has_flag(args, "--follow", Some('f'));
     match subcommand.as_str() {
         "attach" => Err(Error::refused(
@@ -318,6 +357,167 @@ fn refuse_if_endless(args: &[String]) -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+/// What `-i` and `-t` asked for, on the subcommands where that is what they mean.
+///
+/// Elsewhere the same letters are something else entirely — `build -t` is a tag, `logs -t`
+/// timestamps, `stop -t` a timeout, `load -i` a file — and after the image or container
+/// they belong to the command being run, as in `exec api ls -lt`. So only the options of
+/// `run`, `create`, `exec` and `start` are looked at, and only up to the first argument
+/// that is not one.
+///
+/// Compose is left alone: its `run` and `exec` keep stdin open already and turn the
+/// terminal off with `-T`, and they have no `-t` to drop.
+#[derive(Debug, Clone, Copy)]
+struct Terminal {
+    interactive: bool,
+    tty: bool,
+}
+
+impl Terminal {
+    fn of(args: &[String], compose: bool) -> Option<Self> {
+        let (verb, options) = terminal_options(args, compose)?;
+        let mut terminal = Self {
+            interactive: false,
+            tty: false,
+        };
+        for arg in &args[options] {
+            match arg.as_str() {
+                "--interactive" | "--interactive=true" => terminal.interactive = true,
+                "--tty" | "--tty=true" => terminal.tty = true,
+                arg if arg.starts_with('-') && !arg.starts_with("--") => {
+                    let letters = short_flags(verb, arg);
+                    terminal.interactive |= letters.contains('i');
+                    terminal.tty |= letters.contains('t');
+                }
+                _ => {}
+            }
+        }
+        Some(terminal)
+    }
+}
+
+/// The verb, and the span of `args` holding its options, for the subcommands in
+/// [`Terminal`]. The span ends at the first argument that is neither a flag nor the value
+/// of one. A value-taking flag this does not know ends it early, which can only miss a
+/// `-t` (and docker then says so) — never mistake the container's command for options.
+fn terminal_options(
+    args: &[String],
+    compose: bool,
+) -> Option<(&'static str, std::ops::Range<usize>)> {
+    if compose {
+        return None;
+    }
+    let at = usize::from(args.first().is_some_and(|arg| arg == "container"));
+    let verb = match args.get(at)?.as_str() {
+        "run" => "run",
+        "create" => "create",
+        "exec" => "exec",
+        "start" => "start",
+        _ => return None,
+    };
+    let start = at + 1;
+    let mut end = start;
+    while let Some(arg) = args.get(end) {
+        if arg == "-" || arg == "--" || !arg.starts_with('-') {
+            break;
+        }
+        end += 1;
+        if takes_value(verb, arg) {
+            end += 1;
+        }
+    }
+    Some((verb, start..end.min(args.len())))
+}
+
+/// The short and long options of `verb` that take a value.
+fn value_flags(verb: &str) -> (&'static str, &'static [&'static str]) {
+    match verb {
+        "run" | "create" => ("acehlmpuvw", RUN_VALUE_FLAGS),
+        "exec" => (
+            "euw",
+            &["detach-keys", "env", "env-file", "user", "workdir"],
+        ),
+        _ => ("", &["detach-keys", "checkpoint", "checkpoint-dir"]),
+    }
+}
+
+/// The boolean letters of a short-flag cluster such as `-dit`: everything before the first
+/// letter that takes a value, since the rest of the argument is that value (`-ePATH=/x`).
+fn short_flags<'a>(verb: &str, arg: &'a str) -> &'a str {
+    let (short, _) = value_flags(verb);
+    let letters = &arg[1..];
+    match letters.find(|letter| short.contains(letter)) {
+        Some(at) => &letters[..at],
+        None => letters,
+    }
+}
+
+/// Whether `arg` consumes the argument after it.
+fn takes_value(verb: &str, arg: &str) -> bool {
+    let (short, long) = value_flags(verb);
+    if let Some(name) = arg.strip_prefix("--") {
+        return !name.contains('=') && long.contains(&name);
+    }
+    let letters = &arg[1..];
+    letters
+        .find(|letter| short.contains(letter))
+        .is_some_and(|at| at == letters.len() - 1)
+}
+
+/// The long options of `docker run` and `docker create` that take a value, as their
+/// `--help` lists them.
+#[rustfmt::skip]
+const RUN_VALUE_FLAGS: &[&str] = &[
+    "add-host", "annotation", "attach", "blkio-weight", "blkio-weight-device", "cap-add",
+    "cap-drop", "cgroup-parent", "cgroupns", "cidfile", "cpu-period", "cpu-quota",
+    "cpu-rt-period", "cpu-rt-runtime", "cpu-shares", "cpus", "cpuset-cpus", "cpuset-mems",
+    "detach-keys", "device", "device-cgroup-rule", "device-read-bps", "device-read-iops",
+    "device-write-bps", "device-write-iops", "dns", "dns-option", "dns-search", "domainname",
+    "entrypoint", "env", "env-file", "expose", "gpus", "group-add", "health-cmd",
+    "health-interval", "health-retries", "health-start-interval", "health-start-period",
+    "health-timeout", "hostname", "ip", "ip6", "ipc", "isolation", "label", "label-file",
+    "link", "link-local-ip", "log-driver", "log-opt", "mac-address", "memory",
+    "memory-reservation", "memory-swap", "memory-swappiness", "mount", "name", "net",
+    "net-alias", "network", "network-alias", "oom-score-adj", "pid", "pids-limit",
+    "platform", "publish", "pull", "restart", "runtime", "security-opt", "shm-size",
+    "stop-signal", "stop-timeout", "storage-opt", "sysctl", "tmpfs", "ulimit", "umask",
+    "user", "userns", "uts", "volume", "volume-driver", "volumes-from", "workdir",
+];
+
+/// `args` without the terminal: `--tty` removed, and `t` taken out of short clusters,
+/// within the option span only.
+fn drop_tty(args: &[String], compose: bool) -> Vec<String> {
+    let Some((verb, options)) = terminal_options(args, compose) else {
+        return args.to_vec();
+    };
+    args.iter()
+        .enumerate()
+        .filter_map(|(at, arg)| {
+            if !options.contains(&at) || !arg.starts_with('-') {
+                return Some(arg.clone());
+            }
+            if arg == "--tty" || arg == "--tty=true" {
+                return None;
+            }
+            if arg.starts_with("--") {
+                return Some(arg.clone());
+            }
+            let flags = short_flags(verb, arg);
+            let rest = format!("{}{}", flags.replace('t', ""), &arg[1 + flags.len()..]);
+            (!rest.is_empty()).then(|| format!("-{rest}"))
+        })
+        .collect()
+}
+
+/// Remove what a terminal adds to text: escape sequences, and carriage returns.
+fn strip_terminal(text: &str) -> String {
+    static ESCAPES: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]|\r")
+            .expect("valid")
+    });
+    ESCAPES.replace_all(text, "").into_owned()
 }
 
 /// Classify a subcommand from its words.
@@ -466,7 +666,6 @@ mod tests {
             (vec!["events"], "--until"),
             (vec!["compose", "up"], "--detach"),
             (vec!["compose", "watch"], "bounded"),
-            (vec!["exec", "-it", "api", "bash"], "exec` tool"),
             (vec!["run", "nginx"], "--detach"),
         ] {
             let runner = ScriptedRunner::new();
@@ -557,6 +756,162 @@ mod tests {
              [volume inspect, 1 line, exit 1]\n"
         );
         assert_eq!(outcome.status, 1);
+    }
+
+    #[test]
+    fn the_letters_i_and_t_mean_something_else_outside_run_exec_create_and_start() {
+        for args in [
+            vec!["build", "-t", "myimg", "."],
+            vec!["logs", "-t", "api"],
+            vec!["stop", "-t", "5", "api"],
+            vec!["load", "-i", "image.tar"],
+            vec!["exec", "api", "ls", "-lt"],
+            vec!["run", "--rm", "-e", "A=1", "alpine", "ls", "-it"],
+        ] {
+            let key = format!("docker {}", args.join(" "));
+            let runner = ScriptedRunner::new().with(&key, "");
+            let outcome = passthrough(
+                &runner,
+                &PassthroughRequest {
+                    confirm: true,
+                    ..request(&args)
+                },
+            )
+            .unwrap_or_else(|err| panic!("{args:?} was refused: {err}"));
+            assert_eq!(runner.calls(), vec![key], "{args:?} was rewritten");
+            assert!(!outcome.text.contains("dropped"), "{}", outcome.text);
+        }
+    }
+
+    #[test]
+    fn interactive_input_is_written_to_stdin() {
+        let runner = ScriptedRunner::new().with("docker exec -i db psql -U app", "INSERT 0 1\n");
+        let outcome = passthrough(
+            &runner,
+            &PassthroughRequest {
+                stdin: Some("insert into t values (1);\n".to_owned()),
+                ..request(&["exec", "-i", "db", "psql", "-U", "app"])
+            },
+        )
+        .expect("ran");
+        assert_eq!(outcome.text, "INSERT 0 1\n[exec db, 1 line, exit 0]\n");
+        assert_eq!(
+            runner.stdins(),
+            vec![Some("insert into t values (1);\n".to_owned())]
+        );
+    }
+
+    #[test]
+    fn stdin_that_docker_would_not_pass_on_is_refused() {
+        let runner = ScriptedRunner::new();
+        let err = passthrough(
+            &runner,
+            &PassthroughRequest {
+                stdin: Some("select 1;".to_owned()),
+                ..request(&["exec", "db", "psql"])
+            },
+        )
+        .expect_err("refused");
+        assert!(err.to_string().contains("add `-i`"), "{err}");
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn stdin_goes_to_subcommands_that_read_it_without_i() {
+        let runner = ScriptedRunner::new().with("docker build -t img -", "");
+        passthrough(
+            &runner,
+            &PassthroughRequest {
+                stdin: Some("FROM alpine\n".to_owned()),
+                ..request(&["build", "-t", "img", "-"])
+            },
+        )
+        .expect("ran");
+        assert_eq!(runner.stdins(), vec![Some("FROM alpine\n".to_owned())]);
+    }
+
+    #[test]
+    fn oversized_stdin_is_refused() {
+        let err = passthrough(
+            &ScriptedRunner::new(),
+            &PassthroughRequest {
+                stdin: Some("x".repeat(MAX_STDIN_BYTES + 1)),
+                ..request(&["build", "-"])
+            },
+        )
+        .expect_err("refused");
+        assert!(err.to_string().contains("stdin"), "{err}");
+    }
+
+    #[test]
+    fn a_terminal_without_input_is_kept_and_its_escapes_stripped() {
+        let runner = ScriptedRunner::new().with(
+            "docker run --rm -t alpine ls",
+            "\x1b[1;34mbin\x1b[0m\r\ndev\r\n",
+        );
+        let outcome =
+            passthrough(&runner, &request(&["run", "--rm", "-t", "alpine", "ls"])).expect("ran");
+        assert_eq!(outcome.text, "bin\ndev\n[run alpine, 2 lines, exit 0]\n");
+    }
+
+    #[test]
+    fn a_terminal_with_input_is_dropped_and_the_input_kept() {
+        for (args, sent) in [
+            (
+                vec!["exec", "-it", "api", "ls", "-lt"],
+                "docker exec -i api ls -lt",
+            ),
+            (vec!["exec", "-ti", "api", "sh"], "docker exec -i api sh"),
+            (
+                vec!["run", "--rm", "-i", "-t", "-e", "A=1", "alpine", "sh"],
+                "docker run --rm -i -e A=1 alpine sh",
+            ),
+            (
+                vec![
+                    "container",
+                    "run",
+                    "--rm",
+                    "--interactive",
+                    "--tty",
+                    "alpine",
+                ],
+                "docker container run --rm --interactive alpine",
+            ),
+            (vec!["start", "-ait", "api"], "docker start -ai api"),
+            (
+                vec!["run", "-dit", "--name", "box", "alpine"],
+                "docker run -di --name box alpine",
+            ),
+        ] {
+            let runner = ScriptedRunner::new().with(sent, "");
+            let outcome = passthrough(&runner, &request(&args))
+                .unwrap_or_else(|err| panic!("{args:?} was refused: {err}"));
+            assert_eq!(runner.calls(), vec![sent.to_owned()], "{args:?}");
+            assert!(
+                outcome.text.contains("`-t` dropped"),
+                "{args:?}: {}",
+                outcome.text
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_flag_ends_a_cluster() {
+        // `-e` takes the rest of its argument, so the `t` and `i` there are its value.
+        let runner = ScriptedRunner::new().with("docker exec -eTI=it api env", "");
+        passthrough(&runner, &request(&["exec", "-eTI=it", "api", "env"])).expect("ran");
+        assert_eq!(runner.calls(), vec!["docker exec -eTI=it api env"]);
+    }
+
+    #[test]
+    fn compose_run_and_exec_are_left_alone() {
+        let runner = ScriptedRunner::new().with("docker compose exec -T api ls -lt", "");
+        passthrough(
+            &runner,
+            &request(&["compose", "exec", "-T", "api", "ls", "-lt"]),
+        )
+        .expect("ran");
+        assert_eq!(runner.calls(), vec!["docker compose exec -T api ls -lt"]);
     }
 
     #[test]

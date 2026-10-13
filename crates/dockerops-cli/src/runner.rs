@@ -16,7 +16,7 @@
 
 use std::{
     collections::HashMap,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::Mutex,
@@ -92,6 +92,19 @@ pub trait CommandRunner {
         args: &[&str],
         cwd: Option<&Path>,
         timeout: Duration,
+    ) -> std::io::Result<CommandOutput> {
+        self.run_with_stdin(program, args, cwd, timeout, None)
+    }
+
+    /// [`CommandRunner::run`], with `stdin` written to the process and then closed. Without
+    /// it the process reads end-of-file at once, which is what keeps `-i` from waiting.
+    fn run_with_stdin(
+        &self,
+        program: &str,
+        args: &[&str],
+        cwd: Option<&Path>,
+        timeout: Duration,
+        stdin: Option<&str>,
     ) -> std::io::Result<CommandOutput>;
 }
 
@@ -100,16 +113,21 @@ pub trait CommandRunner {
 pub struct SystemRunner;
 
 impl CommandRunner for SystemRunner {
-    fn run(
+    fn run_with_stdin(
         &self,
         program: &str,
         args: &[&str],
         cwd: Option<&Path>,
         timeout: Duration,
+        stdin: Option<&str>,
     ) -> std::io::Result<CommandOutput> {
         let mut cmd = Command::new(program);
         cmd.args(args)
-            .stdin(Stdio::null())
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(dir) = cwd {
@@ -126,6 +144,16 @@ impl CommandRunner for SystemRunner {
 
         tracing::debug!(program, ?args, ?cwd, ?timeout, "running command");
         let mut child = cmd.spawn()?;
+
+        // Written on its own thread for the same reason the pipes are drained on theirs: a
+        // process that answers before it has read everything would otherwise deadlock us.
+        // Dropping the handle afterwards is what closes stdin.
+        if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            let input = input.to_owned();
+            std::thread::spawn(move || {
+                let _ = pipe.write_all(input.as_bytes());
+            });
+        }
 
         // Drain both pipes concurrently; see the module note about buffer deadlock.
         let mut out = child.stdout.take().expect("stdout piped");
@@ -176,6 +204,7 @@ pub struct ScriptedRunner {
     replies: HashMap<String, CommandOutput>,
     calls: Mutex<Vec<String>>,
     cwds: Mutex<Vec<Option<PathBuf>>>,
+    stdins: Mutex<Vec<Option<String>>>,
 }
 
 impl ScriptedRunner {
@@ -228,6 +257,11 @@ impl ScriptedRunner {
         self.cwds.lock().expect("lock").clone()
     }
 
+    /// What each of those calls was given on stdin.
+    pub fn stdins(&self) -> Vec<Option<String>> {
+        self.stdins.lock().expect("lock").clone()
+    }
+
     fn key(program: &str, args: &[&str]) -> String {
         let mut key = String::from(program);
         for arg in args {
@@ -239,12 +273,13 @@ impl ScriptedRunner {
 }
 
 impl CommandRunner for ScriptedRunner {
-    fn run(
+    fn run_with_stdin(
         &self,
         program: &str,
         args: &[&str],
         cwd: Option<&Path>,
         _timeout: Duration,
+        stdin: Option<&str>,
     ) -> std::io::Result<CommandOutput> {
         let key = Self::key(program, args);
         self.calls.lock().expect("lock").push(key.clone());
@@ -252,6 +287,10 @@ impl CommandRunner for ScriptedRunner {
             .lock()
             .expect("lock")
             .push(cwd.map(Path::to_path_buf));
+        self.stdins
+            .lock()
+            .expect("lock")
+            .push(stdin.map(str::to_owned));
         Ok(self.replies.get(&key).cloned().unwrap_or(CommandOutput {
             status: 127,
             stdout: String::new(),

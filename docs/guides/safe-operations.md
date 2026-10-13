@@ -33,7 +33,15 @@ Calls that can hang are refused or normalized:
 - `run` requires detached (`-d`) or ephemeral (`--rm`) mode
 - `events` always includes `--until`
 - `stats` always non-streaming
-- passthrough refuses `attach`, `wait`, `compose watch`, `logs -f`, `events` without `--until`, `stats` without `--no-stream`, `compose up` without `-d`, and interactive/TTY flags
+- passthrough refuses `attach`, `wait`, `compose watch`, `logs -f`, `events` without `--until`, `stats` without `--no-stream`, and `compose up` without `-d`
+
+Interactive and terminal flags are allowed on `run`, `create`, `exec` and `start`:
+
+- `-i` keeps stdin open; pass the input as the `stdin` parameter (up to 1 MiB). Without it stdin is empty, so the command reads end-of-file instead of waiting.
+- `-t` allocates a terminal; carriage returns and escape codes are stripped from the output.
+- `-it` runs as `-i`, because stdin is never a terminal and docker would refuse the pair. The footer says `-t` was dropped.
+
+Elsewhere `-i` and `-t` are left alone: `build -t` is a tag, `logs -t` timestamps, `load -i` an input file, and anything after the image or container belongs to the command being run.
 
 ## Classification model for passthrough
 

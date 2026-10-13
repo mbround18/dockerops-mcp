@@ -150,6 +150,18 @@ Docker build example:
 }
 ```
 
+Feeding input to a container with `-i`:
+
+```json
+{
+  "tool":"passthrough",
+  "arguments":{
+    "args":["exec","-i","db","psql","-U","app"],
+    "stdin":"select count(*) from users;\n"
+  }
+}
+```
+
 Refused unbounded example:
 
 ```json

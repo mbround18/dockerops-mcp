@@ -54,7 +54,10 @@ make install
 8. **No implicit shell execution.**
    - Tools accept argv lists by default.
    - `exec.shell` is explicit and opt-in for pipes/redirects.
-   - TTY/interactive paths are refused where they can hang or distort output.
+   - passthrough stdin is a closed pipe (empty, or the caller's `stdin` text), so `-i`
+     always reaches end-of-file. `-it` is rewritten to `-i`, and `-t` output has its
+     escape codes stripped. Only the option span of `run`/`create`/`exec`/`start` is
+     rewritten, never the container's own command.
 
 9. **Unknown passthrough subcommands are conservative.**
    - Unrecognized verbs classify as `mutate`, never `read`.

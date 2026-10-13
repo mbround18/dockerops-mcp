@@ -173,13 +173,24 @@ pub fn run(
     invocation: &Invocation,
     args: &[String],
 ) -> Result<CommandOutput> {
+    run_with_stdin(runner, invocation, args, None)
+}
+
+/// [`run`], with `stdin` handed to the process.
+pub fn run_with_stdin(
+    runner: &dyn CommandRunner,
+    invocation: &Invocation,
+    args: &[String],
+    stdin: Option<&str>,
+) -> Result<CommandOutput> {
     let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
     runner
-        .run(
+        .run_with_stdin(
             invocation.bin(),
             &borrowed,
             invocation.dir(),
             invocation.timeout(),
+            stdin,
         )
         .map_err(|err| Error::DockerMissing {
             bin: invocation.bin().to_owned(),

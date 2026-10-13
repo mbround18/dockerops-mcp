@@ -503,6 +503,11 @@ pub struct PassthroughParams {
     /// Cap on lines rendered. Defaults to 300.
     #[serde(default)]
     pub max_lines: Option<usize>,
+    /// Text written to the command's stdin, then closed: a SQL script for
+    /// `["exec", "-i", "db", "psql"]`, a Dockerfile for `["build", "-"]`. Up to 1 MiB.
+    /// `run`, `create`, `exec` and `start` also need `-i` to pass it on.
+    #[serde(default)]
+    pub stdin: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
@@ -992,7 +997,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "passthrough",
-        description = "Any other docker or compose subcommand, as an argument list: `cp`, `top`, `port`, `history`, `network inspect`, `volume prune`, `buildx bake`, `swarm init` — the rest of both CLIs, which is far too much to describe one tool at a time. What you give up is the rendering; what you keep is the byte budget, the deadline, the flag-injection guard and two rules. Nothing may stream: `attach`, `wait`, `compose watch`, `logs -f`, `stats` without `--no-stream`, `events` without `--until` and `compose up` without `-d` are refused by name, with a pointer to the bounded form. Nothing destroys state by accident: every subcommand is classed read, mutate or destroy from its verb, and a destroy needs `confirm: true`. An unrecognised subcommand is assumed to mutate. Prefer the dedicated tool when there is one — it renders the answer instead of the CLI's table."
+        description = "Any other docker or compose subcommand, as an argument list: `cp`, `top`, `port`, `history`, `network inspect`, `volume prune`, `buildx bake`, `swarm init` — the rest of both CLIs, which is far too much to describe one tool at a time. What you give up is the rendering; what you keep is the byte budget, the deadline, the flag-injection guard and two rules. Nothing may stream: `attach`, `wait`, `compose watch`, `logs -f`, `stats` without `--no-stream`, `events` without `--until` and `compose up` without `-d` are refused by name, with a pointer to the bounded form. `-i` works with `stdin` as the input; `-t` works and its escape codes are stripped; `-it` runs as `-i`, since stdin is never a terminal. Nothing destroys state by accident: every subcommand is classed read, mutate or destroy from its verb, and a destroy needs `confirm: true`. An unrecognised subcommand is assumed to mutate. Prefer the dedicated tool when there is one — it renders the answer instead of the CLI's table."
     )]
     fn passthrough(
         &self,
@@ -1010,6 +1015,7 @@ impl DockerOpsServer {
             head: params.head,
             max_lines: params.max_lines,
             max_bytes: self.budget(params.engine.max_bytes),
+            stdin: params.stdin,
         };
 
         match dockerops_cli::passthrough(&dockerops_cli::SystemRunner, &request) {
