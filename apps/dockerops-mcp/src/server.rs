@@ -22,7 +22,7 @@ use dockerops_cli::{
 };
 use rmcp::{
     ErrorData, ServerHandler,
-    handler::server::wrapper::Parameters,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig},
     tool, tool_router,
 };
@@ -91,23 +91,29 @@ by name, and says which tool answers the same question.
 A failure that belongs to one target is one line of output next to the targets that \
 worked, never a failed call. Anything that destroys state — `compose down`, `rm`, `rmi`, \
 `prune`, `kill` — needs `confirm: true`, and the refusal says what would have gone; ask a \
-read tool what exists before confirming. The read tools are unaffected by `--read-only`.";
+read tool what exists before confirming. The read tools are unaffected by `--read-only`.
+
+Every tool also takes `cwd` (directory to run in, where relative compose files resolve), \
+`host` (daemon, as `DOCKER_HOST` takes it), `timeout_seconds` (default 30) and \
+`max_bytes` (output ceiling, default 40000, max 400000).";
 
 /// Which Docker to talk to, and for how long. Shared by every tool.
+///
+/// The fields carry `//` rather than `///` comments on purpose: a doc comment becomes a
+/// schema description, which would be sent thirteen times on every request. They are
+/// described once, in [`INSTRUCTIONS`].
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct EngineParams {
-    /// Directory to run in — where a relative compose file is found. Defaults to the
-    /// server's own working directory.
+    // Directory to run in; where a relative compose file is found.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Daemon to talk to (`DOCKER_HOST`), for a remote or rootless socket.
+    // Daemon to talk to, as `DOCKER_HOST` takes it.
     #[serde(default)]
     pub host: Option<String>,
-    /// Seconds to wait for the Docker CLI before giving up. Defaults to 30.
+    // Seconds before the Docker CLI is killed. Defaults to 30.
     #[serde(default)]
     pub timeout_seconds: Option<u64>,
-    /// Ceiling on rendered output in bytes (default 40000, max 400000). Output is
-    /// truncated with a marker rather than silently cut.
+    // Ceiling on rendered output in bytes (default 40000, max 400000).
     #[serde(default)]
     pub max_bytes: Option<usize>,
 }
@@ -555,6 +561,8 @@ fn bool_true() -> bool {
 
 #[derive(Debug, Clone)]
 pub struct DockerOpsServer {
+    /// Built once, with its schemas compacted; see [`compact`].
+    tool_router: ToolRouter<Self>,
     /// Server-wide default budget, from `--max-bytes`. A request may still name its own.
     default_max_bytes: Option<usize>,
     /// Docker binary, from `--docker-bin`, for a podman shim or an unusual install.
@@ -572,6 +580,7 @@ impl DockerOpsServer {
         read_only: bool,
     ) -> Self {
         Self {
+            tool_router: compact(Self::tool_router()),
             default_max_bytes,
             docker_bin,
             read_only,
@@ -1061,7 +1070,7 @@ impl DockerOpsServer {
     }
 }
 
-#[rmcp::tool_handler]
+#[rmcp::tool_handler(router = self.tool_router)]
 impl ServerHandler for DockerOpsServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
@@ -1070,6 +1079,59 @@ impl ServerHandler for DockerOpsServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(INSTRUCTIONS)
+    }
+}
+
+/// Remove what a schema says that a model learns nothing from.
+///
+/// Every tool's schema is re-sent with every request, so this is paid per turn: the
+/// `$schema` URL, a `default` of `null`, `[]` or `false`, the `null` half of an optional
+/// field's type (not being `required` already says it is optional), and the
+/// unsigned-integer `format` and `minimum: 0`, which serde enforces on the way in anyway.
+/// About a sixth of the schemas' size.
+fn compact(mut router: ToolRouter<DockerOpsServer>) -> ToolRouter<DockerOpsServer> {
+    for route in router.map.values_mut() {
+        let mut schema = serde_json::Value::Object((*route.attr.input_schema).clone());
+        trim(&mut schema);
+        if let serde_json::Value::Object(object) = schema {
+            route.attr.input_schema = std::sync::Arc::new(object);
+        }
+    }
+    router
+}
+
+fn trim(node: &mut serde_json::Value) {
+    use serde_json::Value;
+    match node {
+        Value::Object(map) => {
+            map.remove("$schema");
+            if map.get("default").is_some_and(|default| {
+                matches!(default, Value::Null | Value::Bool(false))
+                    || default.as_array().is_some_and(Vec::is_empty)
+            }) {
+                map.remove("default");
+            }
+            if map
+                .get("format")
+                .and_then(Value::as_str)
+                .is_some_and(|format| format.starts_with("uint"))
+            {
+                map.remove("format");
+            }
+            if map.get("minimum").and_then(Value::as_u64) == Some(0) {
+                map.remove("minimum");
+            }
+            if let Some(Value::Array(types)) = map.get("type")
+                && types.len() == 2
+                && types.contains(&Value::from("null"))
+            {
+                let kept = types.iter().find(|kind| *kind != "null").cloned();
+                map.insert("type".to_owned(), kept.unwrap_or(Value::Null));
+            }
+            map.values_mut().for_each(trim);
+        }
+        Value::Array(items) => items.iter_mut().for_each(trim),
+        _ => {}
     }
 }
 

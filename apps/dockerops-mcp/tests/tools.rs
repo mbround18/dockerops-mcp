@@ -34,6 +34,24 @@ fn every_tool_is_advertised_with_the_parameters_that_replace_a_pipeline() {
         ]
     );
 
+    // Schemas are re-sent every request; the parts a model learns nothing from are gone.
+    for tool in listed {
+        let schema = tool["inputSchema"].to_string();
+        for noise in ["$schema", "\"null\"", "\"uint", "\"minimum\":0"] {
+            assert!(
+                !schema.contains(noise),
+                "{} schema still has {noise}: {schema}",
+                tool["name"]
+            );
+        }
+        assert!(
+            tool["inputSchema"]["properties"]["cwd"]
+                .get("description")
+                .is_none(),
+            "shared params are described once, in the instructions"
+        );
+    }
+
     let logs = listed.iter().find(|tool| tool["name"] == "logs").unwrap();
     let schema = logs["inputSchema"].to_string();
     for parameter in [
