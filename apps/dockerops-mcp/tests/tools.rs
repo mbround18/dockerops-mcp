@@ -371,12 +371,14 @@ fn verify_startup_runs_cold_volume_flow_and_cleans_up() {
     assert!(result.text().contains("FAILED on enshrouded-wine-test"));
     let calls = fake.calls();
     assert!(
-        calls.iter()
+        calls
+            .iter()
             .any(|line| line.contains("volume create verify-enshrouded-wine-test-run3-vol")),
         "{calls:?}"
     );
     assert!(
-        calls.iter()
+        calls
+            .iter()
             .any(|line| line.contains("volume rm -f verify-enshrouded-wine-test-run3-vol")),
         "{calls:?}"
     );

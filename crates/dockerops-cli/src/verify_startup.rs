@@ -4,7 +4,11 @@
 //! create isolated storage, run container, poll readiness, capture logs, clean up.
 //! The outcome is one bounded call with per-image pass/fail evidence.
 
-use std::{path::Path, thread, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    path::Path,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use serde::Serialize;
 
@@ -102,9 +106,7 @@ pub fn verify_startup(
     let initial_delay = request
         .initial_delay_seconds
         .unwrap_or(DEFAULT_INITIAL_DELAY_SECONDS);
-    let interval = request
-        .interval_seconds
-        .unwrap_or(DEFAULT_INTERVAL_SECONDS);
+    let interval = request.interval_seconds.unwrap_or(DEFAULT_INTERVAL_SECONDS);
     let max_attempts = request.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);
     let log_tail = request.log_tail_lines.unwrap_or(DEFAULT_LOG_TAIL_LINES);
     let pause_between = request.pause_between_images_seconds.unwrap_or(5);
@@ -196,7 +198,13 @@ pub fn verify_startup(
                 let ps = docker(
                     runner,
                     &request.invocation,
-                    vec!["ps", "--filter", &format!("name={container}"), "--format", "{{.Names}}"],
+                    vec![
+                        "ps",
+                        "--filter",
+                        &format!("name={container}"),
+                        "--format",
+                        "{{.Names}}",
+                    ],
                 )?;
                 let still_running = ps.stdout_lines().any(|line| line == container);
                 if !still_running {
@@ -241,7 +249,12 @@ pub fn verify_startup(
             let _ = docker_owned(
                 runner,
                 &request.invocation,
-                vec!["volume".to_owned(), "rm".to_owned(), "-f".to_owned(), volume.clone()],
+                vec![
+                    "volume".to_owned(),
+                    "rm".to_owned(),
+                    "-f".to_owned(),
+                    volume.clone(),
+                ],
             )?;
             cleaned_up = true;
         }
@@ -282,7 +295,11 @@ pub fn verify_startup(
             result.image, result.volume, result.container, status, result.image
         );
         if result.ready {
-            block.push_str(&format!(" after {} {}", result.attempts, plural(result.attempts, "attempt")));
+            block.push_str(&format!(
+                " after {} {}",
+                result.attempts,
+                plural(result.attempts, "attempt")
+            ));
             if let Some(probe) = &result.probe_output {
                 block.push_str(&format!("\nprobe: {probe}"));
             }
@@ -302,7 +319,8 @@ pub fn verify_startup(
             cut += 1;
         }
     }
-    let truncated = (cut > 0).then(|| format!("{cut} image results not shown, byte budget reached"));
+    let truncated =
+        (cut > 0).then(|| format!("{cut} image results not shown, byte budget reached"));
     body.push_str(&format!(
         "[{}, {}, {}",
         plural(results.len(), "image"),
@@ -448,7 +466,9 @@ mod tests {
         assert_eq!(outcome.failed, 1);
         assert!(outcome.results[0].container_exited);
         assert!(
-            outcome.text.contains("container exited before readiness probe succeeded"),
+            outcome
+                .text
+                .contains("container exited before readiness probe succeeded"),
             "{}",
             outcome.text
         );

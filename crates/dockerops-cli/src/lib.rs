@@ -64,7 +64,9 @@ pub use run::{RunOutcome, RunRequest, run};
 pub use runner::{CommandOutput, CommandRunner, ScriptedRunner, SystemRunner};
 pub use stats::{StatsOutcome, StatsRequest, stats};
 pub use usage::{UsageOutcome, UsageRequest, usage};
-pub use verify_startup::{VerifyImageResult, VerifyStartupOutcome, VerifyStartupRequest, verify_startup};
+pub use verify_startup::{
+    VerifyImageResult, VerifyStartupOutcome, VerifyStartupRequest, verify_startup,
+};
 
 /// What can go wrong before any container is touched.
 ///
