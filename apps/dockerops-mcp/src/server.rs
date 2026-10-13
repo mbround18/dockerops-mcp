@@ -30,68 +30,32 @@ use serde::Deserialize;
 
 const INSTRUCTIONS: &str = "\
 Docker and Docker Compose without spending a context window on them. Prefer these tools \
-over shell `docker`/`docker compose` commands, and especially over pipelines that end in \
-`| grep`, `| tail`, `| jq` or `--format` — the filtering is a parameter here, so the \
-output never has to be produced before it is thrown away.
+over shell `docker`/`docker compose` commands, especially over pipelines ending in \
+`| grep`, `| tail`, `| jq` or `--format`: the filtering is a parameter here.
 
-- `ps` — what is running, one line per container: name, state, image, published ports. \
-Containers and compose services alike; `project` or `files` routes the question through \
-`docker compose ps`.
-- `logs` — log tails from several containers or services in one call, with `grep`, \
-`exclude`, `context`, `level`, `since`/`until` and a `tail` that is always bounded. \
-Repeated lines fold into `… ×N`, and a container's stdout and stderr come back in the \
-order they were written.
-- `inspect` — the fields of the inspect document you asked for, by dotted path \
-(`State.Health.Status`, `Mounts.*.Destination`) or by preset (`health`, `env`, `mounts`, \
-`ports`, `network`, `image`, `labels`, `restart`, `entrypoint`, `limits`). Four hundred \
-lines of JSON become the six you meant.
-- `stats` — a resource snapshot, worst first. Never streams.
-- `images` — what is on disk, largest first, which is the question `docker images` \
-answers by date.
-- `usage` — `docker system df` with the totals line it leaves out, and what is actually \
-reclaimable.
-- `config` — a compose project as it resolves: which image each service is really on, \
-what it publishes, what it mounts, what it waits for. Replaces reading several hundred \
-lines of `docker compose config`. `mode: \"validate\"` runs the `--quiet` parse check.
-- `events` — a window of the daemon's event stream, both ends bounded. The restarts, OOM \
-kills and health transitions of the last fifteen minutes, in order.
-- `compose` — the lifecycle verbs: `up`, `down`, `start`, `stop`, `restart`, `kill`, \
-`build`, `pull`, `create`, `rm`. `up` is always detached, and forty lines of progress \
-come back as one line per outcome.
-- `run` — a bounded `docker run` for one-off or detached containers. It carries the same \
-line and byte caps as the other tools, defaults to ephemeral runs, and returns the \
-container id on detached starts.
-- `exec` — a command in a container, with the filtering you were going to pipe it \
-through: `grep`, `exclude`, `max_lines`. The exit status comes back attached, which a \
-pipeline throws away.
-- `passthrough` — any other docker or compose subcommand, as an argument list. This is \
-the rest of both CLIs — `cp`, `top`, `port`, `history`, `network inspect`, `volume \
-prune`, `buildx bake`, `swarm init` — under the same budget, deadline and rules.
-- `verify_startup` — cold-volume startup verification for one or more images: run \
-detached, poll a readiness URL, capture tail logs, clean up, and return pass/fail \
-evidence per image in one bounded call.
+- `ps`: containers or compose services, one line each.
+- `logs`: bounded, filtered log tails from several targets at once.
+- `inspect`: chosen `docker inspect` fields, by dotted path or preset.
+- `stats`: a resource snapshot, worst first.
+- `images`: images on disk, largest first.
+- `usage`: `docker system df` with totals and what is reclaimable.
+- `config`: a compose project as it resolves; `mode: \"validate\"` checks it parses.
+- `events`: a bounded window of daemon events: restarts, OOM kills, health changes.
+- `compose`: lifecycle verbs, summarised; `up` is always detached.
+- `run`: a bounded `docker run`.
+- `exec`: a command in a container, output filtered, exit status attached.
+- `passthrough`: any other docker or compose subcommand, under the same rules.
+- `verify_startup`: cold-volume startup check of images against a readiness URL.
 
-Two habits make the difference:
+Batch targets into one call, and filter in the call (`grep`, `level`, `fields`): filters \
+run before the byte budget. Every response is capped and says what it left out; on \
+truncation, narrow the request rather than repeating it.
 
-1. **Batch.** One `logs` call naming four services, or one `inspect` naming four \
-containers, costs one round trip. Four calls, or a shell command joining four invocations, \
-cost far more for the same bytes.
-2. **Filter in the call.** `level: \"error\"`, `grep`, a dotted `fields` path — all of it \
-runs before the byte budget, so the budget is spent on the lines that answer the question \
-rather than on startup noise. Every response is capped and says what it left out, so a \
-reply that reports truncation is an instruction to narrow the request, not to retry it \
-unchanged.
-
-Nothing here follows a stream: there is no `-f`, `up` is always `-d`, `stats` is always \
-`--no-stream`, and `events` always has a far end. A tool call that does not terminate \
-takes the conversation with it, so the way to see what happened next is another call with \
-`since`. `passthrough` refuses `attach`, `wait`, `compose watch` and the unbounded flags \
-by name, and says which tool answers the same question.
-
-A failure that belongs to one target is one line of output next to the targets that \
-worked, never a failed call. Anything that destroys state — `compose down`, `rm`, `rmi`, \
-`prune`, `kill` — needs `confirm: true`, and the refusal says what would have gone; ask a \
-read tool what exists before confirming. The read tools are unaffected by `--read-only`.
+Nothing streams: there is no `-f`, `up` is always `-d`, `stats` never streams and \
+`events` always has an end. To see what happened next, call again with `since`. A \
+failure on one target is one line beside the others, not a failed call. Destructive \
+actions (`compose down`, `rm`, `rmi`, `prune`, `kill`) need `confirm: true`; check what \
+exists with a read tool first. The read tools are unaffected by `--read-only`.
 
 Every tool also takes `cwd` (directory to run in, where relative compose files resolve), \
 `host` (daemon, as `DOCKER_HOST` takes it), `timeout_seconds` (default 30) and \
@@ -141,8 +105,7 @@ pub struct PsParams {
     pub engine: EngineParams,
     #[serde(flatten)]
     pub compose: ComposeParams,
-    /// Include stopped containers. Off by default: `docker ps` without `-a` is the
-    /// question people usually mean.
+    /// Include stopped containers.
     #[serde(default)]
     pub all: bool,
     /// Limit to these containers, or these compose services.
@@ -166,13 +129,12 @@ pub struct LogsParams {
     pub engine: EngineParams,
     #[serde(flatten)]
     pub compose: ComposeParams,
-    /// Containers, or compose services when a `project`/`files` is given. Several in one
-    /// call is the point of this tool. Empty, with a compose project, reads the whole
-    /// project and attributes each line to the service that wrote it.
+    /// Containers, or compose services when `project`/`files` is given. Empty with a
+    /// project reads every service.
     #[serde(default)]
     pub targets: Vec<String>,
-    /// Lines to ask Docker for, per target, before filtering. Defaults to 80. Raise it
-    /// when combining with `grep`: the filter runs on what this fetched.
+    /// Lines fetched per target before filtering. Defaults to 80; raise it when using
+    /// `grep`.
     #[serde(default)]
     pub tail: Option<usize>,
     /// Only lines since this point: `10m`, `2h`, `2026-10-06T12:00:00`.
@@ -184,31 +146,25 @@ pub struct LogsParams {
     /// Keep only lines matching any of these regexes.
     #[serde(default)]
     pub grep: Vec<String>,
-    /// Drop lines matching any of these regexes, applied after `grep` — the health check
-    /// that logs every ten seconds, for instance.
+    /// Drop lines matching any of these regexes, applied after `grep`.
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// `error` or `warn`: a built-in pattern for the usual question, instead of writing
-    /// the regex. Combines with `grep`, which keeps lines matching either.
+    /// `error` or `warn`: a built-in pattern, combined with `grep` as either-matches.
     #[serde(default)]
     pub level: Option<String>,
-    /// Lines of context either side of a kept line, so a stack trace arrives with the
-    /// line that caused it.
+    /// Lines of context either side of a kept line.
     #[serde(default)]
     pub context: Option<usize>,
-    /// Case-insensitive matching for `grep` and `exclude`. On by default: logs are prose.
+    /// Case-insensitive `grep` and `exclude`. On by default.
     #[serde(default)]
     pub ignore_case: Option<bool>,
-    /// Keep the time of day on each line. Off by default — in a tail, the timestamps are
-    /// usually a column of near-identical text.
+    /// Keep each line's timestamp. Off by default.
     #[serde(default)]
     pub timestamps: bool,
-    /// Fold runs of identical lines into one with a `×N` count. On by default, and the
-    /// difference between reading a crash loop and paying for it.
+    /// Fold runs of identical lines into one with a `×N` count. On by default.
     #[serde(default)]
     pub collapse: Option<bool>,
-    /// Render the start of the window rather than the end: the first lines of a startup
-    /// rather than the last lines of a failure.
+    /// Render the start of the window rather than the end.
     #[serde(default)]
     pub head: bool,
     /// Cap on rendered lines per target, after filtering. Defaults to 200.
@@ -222,23 +178,18 @@ pub struct InspectParams {
     pub engine: EngineParams,
     /// Containers, images, networks or volumes. Several in one call.
     pub targets: Vec<String>,
-    /// `container`, `image`, `network` or `volume`. Omitted, Docker resolves a bare name
-    /// against containers first, which is occasionally the wrong guess.
+    /// `container`, `image`, `network` or `volume`. Omitted, Docker tries containers first.
     #[serde(default)]
     pub kind: Option<String>,
-    /// Dotted paths into the inspect document: `State.Health.Status`,
-    /// `Mounts.*.Destination`, `Config.Env`, `NetworkSettings.Networks.*.IPAddress`. `*`
-    /// means every element of an array or every key of an object, and comes back as the
-    /// index or key it matched.
+    /// Dotted paths: `State.Health.Status`, `Config.Env`,
+    /// `NetworkSettings.Networks.*.IPAddress`. `*` matches every element or key.
     #[serde(default)]
     pub fields: Vec<String>,
-    /// A named field set, used when `fields` is empty: `health`, `env`, `mounts`, `ports`,
-    /// `network`, `image`, `labels`, `restart`, `entrypoint`, `limits`, `summary`.
-    /// Defaults to `summary`.
+    /// Used when `fields` is empty: `health`, `env`, `mounts`, `ports`, `network`, `image`,
+    /// `labels`, `restart`, `entrypoint`, `limits`, or `summary` (default).
     #[serde(default)]
     pub preset: Option<String>,
-    /// List the keys at each path instead of their values — how to find out what a
-    /// document holds before asking for any of it.
+    /// List the keys at each path instead of their values.
     #[serde(default)]
     pub keys: bool,
     /// Cap on the characters of any one rendered value. Defaults to 240.
@@ -274,7 +225,7 @@ pub struct ImagesParams {
     /// Include intermediate layers (`--all`).
     #[serde(default)]
     pub all: bool,
-    /// Include untagged images. On by default: they are usually where the disk went.
+    /// Include untagged images. On by default.
     #[serde(default)]
     pub dangling: Option<bool>,
     /// `size` (default), `created` or `name`.
@@ -306,14 +257,12 @@ pub struct ConfigParams {
     /// Limit to these services.
     #[serde(default)]
     pub services: Vec<String>,
-    /// `summary` (default: image, ports, mounts, dependencies per service), `services`
-    /// (names only), `images`, `resources` (volumes and networks, and what uses them),
-    /// `profiles` (which services a `--profile` would bring up), or `validate` (run
-    /// `docker compose config --quiet` and report only whether the config is valid).
+    /// `summary` (default), `services` (names only), `images`, `resources` (volumes and
+    /// networks, and what uses them), `profiles` (what each `--profile` brings up), or
+    /// `validate` (`config --quiet`: valid, or the error).
     #[serde(default)]
     pub mode: Option<String>,
-    /// Leave `${VAR}` unresolved, to see the file's own intent rather than this machine's
-    /// environment.
+    /// Leave `${VAR}` unresolved.
     #[serde(default)]
     pub raw: bool,
 }
@@ -337,11 +286,10 @@ pub struct EventsParams {
     /// Start of the window: `15m` (the default), `2h`, or a timestamp.
     #[serde(default)]
     pub since: Option<String>,
-    /// End of the window. Defaults to `0s`, meaning now. There is no open-ended form: an
-    /// unbounded `docker events` waits for the next event forever.
+    /// End of the window. Defaults to `0s`, meaning now.
     #[serde(default)]
     pub until: Option<String>,
-    /// Fold a run of identical events into one line and a `×N` count — a crash loop.
+    /// Fold runs of identical events into one line with a `×N` count.
     #[serde(default)]
     pub collapse: bool,
     /// Cap on events rendered, keeping the recent end. Defaults to 100.
@@ -375,12 +323,11 @@ pub struct ComposeActionParams {
     /// Remove containers for services no longer in the compose file.
     #[serde(default)]
     pub remove_orphans: bool,
-    /// `up --wait`: return once the containers are healthy rather than merely started.
-    /// Bounded by `timeout_seconds` like everything else.
+    /// `up --wait`: return once containers are healthy. Bounded by `timeout_seconds`.
     #[serde(default)]
     pub wait: bool,
-    /// With `down` or `rm`: also delete the project's named volumes, and whatever data is
-    /// in them. Never implied.
+    /// With `down` or `rm`: also delete the project's named volumes and their data. Never
+    /// implied.
     #[serde(default)]
     pub volumes: bool,
     /// Seconds a container gets to shut down before SIGKILL.
@@ -396,12 +343,10 @@ pub struct ExecParams {
     pub compose: ComposeParams,
     /// A container name or id, or a compose service when `project`/`files` is given.
     pub target: String,
-    /// The command as a list: `["ls", "-la", "/data"]`. No shell is involved, so there is
-    /// nothing to quote.
+    /// The command as a list: `["ls", "-la", "/data"]`.
     #[serde(default)]
     pub argv: Vec<String>,
-    /// A shell command line instead of `argv`, run as `sh -c`. The only way to get a pipe
-    /// or a redirect, and it has to be asked for by name.
+    /// A command line run as `sh -c`, instead of `argv`, for pipes and redirects.
     #[serde(default)]
     pub shell: Option<String>,
     /// `--user`.
@@ -487,12 +432,11 @@ pub struct PassthroughParams {
     pub engine: EngineParams,
     #[serde(flatten)]
     pub compose: ComposeParams,
-    /// The subcommand and its arguments as a list: `["volume", "inspect", "ens-data"]`,
-    /// `["image", "history", "postgres:17"]`, `["cp", "api:/etc/conf", "./conf"]`. Global
-    /// flags do not go here — `host` is `-H`, `cwd` is the working directory.
+    /// Subcommand and arguments: `["volume", "inspect", "ens-data"]`. No global flags; use
+    /// `host` and `cwd`.
     pub args: Vec<String>,
-    /// Required when the subcommand is classed `destroy`: `rm`, `rmi`, `prune`, `kill`,
-    /// `down`, and the same verbs under `volume`, `network`, `image` or `system`.
+    /// Required for subcommands classed destroy: `rm`, `rmi`, `prune`, `kill`, `down`,
+    /// under any noun.
     #[serde(default)]
     pub confirm: bool,
     /// Keep only output lines matching this regex.
@@ -509,9 +453,8 @@ pub struct PassthroughParams {
     /// Cap on lines rendered. Defaults to 300.
     #[serde(default)]
     pub max_lines: Option<usize>,
-    /// Text written to the command's stdin, then closed: a SQL script for
-    /// `["exec", "-i", "db", "psql"]`, a Dockerfile for `["build", "-"]`. Up to 1 MiB.
-    /// `run`, `create`, `exec` and `start` also need `-i` to pass it on.
+    /// Text written to stdin, then closed (max 1 MiB), e.g. a SQL script for `["exec",
+    /// "-i", "db", "psql"]`. `run`, `create`, `exec` and `start` need `-i` to pass it on.
     #[serde(default)]
     pub stdin: Option<String>,
 }
@@ -550,7 +493,7 @@ pub struct VerifyStartupParams {
     /// Delay between image runs when several images are verified in one call.
     #[serde(default)]
     pub pause_between_images_seconds: Option<u64>,
-    /// Optional deterministic id suffix for names/volumes (useful in CI/tests).
+    /// Fixed suffix for container and volume names, for deterministic runs.
     #[serde(default)]
     pub run_id: Option<String>,
 }
@@ -611,7 +554,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "ps",
-        description = "What is running, one line per container: name, state with its age, image, published ports. Replaces `docker ps`, whose header and seven padded columns spend a screen on facts that fit in forty characters. Naming a compose `project` or `files` asks `docker compose ps` instead, so services and containers are the same question. `all` includes stopped containers, `filter` takes Docker's own `key=value` filters. Dual-stack port pairs collapse to one entry and health is shown only when it is bad."
+        description = "What is running, one line per container: name, state and age, image, published ports. `project`/`files` asks `docker compose ps` instead. `all` includes stopped containers; `filter` takes Docker's `key=value` filters. Health is shown only when it is bad."
     )]
     fn ps(&self, Parameters(params): Parameters<PsParams>) -> Result<CallToolResult, ErrorData> {
         let sort = match params.sort.as_deref() {
@@ -643,7 +586,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "logs",
-        description = "Log tails from several containers or compose services in one call, filtered the way you were going to filter them anyway. Replaces `docker logs`/`docker compose logs` and the `| grep … | tail -40` that always follows: `grep`, `exclude`, `context`, `level` and `since`/`until` are parameters, so the lines that do not answer the question are never rendered. `tail` is always bounded (80 by default), runs of identical lines fold into `… ×N`, and stdout and stderr come back interleaved in the order they were written. There is no follow mode — call again with `since` for what happened next. One unreadable target is one line of output, not a failed call."
+        description = "Log tails from several containers or compose services in one call. `grep`, `exclude`, `context`, `level` and `since`/`until` filter before anything is rendered; `tail` is always bounded; runs of identical lines fold into `… ×N`; stdout and stderr interleave in the order written. No follow mode: call again with `since`. A target that fails is one line of output, not a failed call."
     )]
     fn logs(
         &self,
@@ -686,7 +629,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "inspect",
-        description = "The fields of `docker inspect` you asked for, not the document. Takes dotted paths (`State.Health.Status`, `Mounts.*.Destination`, `Config.Env`) or a named preset (`health`, `env`, `mounts`, `ports`, `network`, `image`, `labels`, `restart`, `entrypoint`, `limits`, `summary`), over as many targets as you like in one call. A `*` matches every element or key and comes back as the one it matched; `keys: true` lists a level's shape instead of its contents, so an unfamiliar document can be explored a level at a time. A path that matches nothing is reported, because the alternative is reading a typo as an empty field. Replaces `docker inspect | jq` and hand-written Go templates."
+        description = "Chosen fields of `docker inspect`, for many targets in one call: dotted paths in `fields` (`State.Health.Status`, `Mounts.*.Destination`) or a `preset`. `*` matches every element or key and reports which; `keys: true` lists a level's keys instead of values. A path that matches nothing is reported as such."
     )]
     fn inspect(
         &self,
@@ -736,7 +679,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "stats",
-        description = "A resource snapshot: one line per container, worst first, memory as a share of its limit. Replaces `docker stats`, which is a live full-screen display that never returns — this one always passes `--no-stream`, because a tool call that does not terminate takes the conversation with it. Sort by `cpu` (default), `memory` or `name`; network and disk figures appear only when something has actually moved."
+        description = "A resource snapshot, one line per container, worst first, memory as a share of its limit. Always `--no-stream`. Network and disk figures appear only when nonzero."
     )]
     fn stats(
         &self,
@@ -768,7 +711,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "images",
-        description = "What is on disk, largest first — the question `docker images` answers by creation date. One line per image: reference, size, age. `patterns` and Docker's own `key=value` `filter`s narrow it, `dangling: false` hides untagged images once you have seen them. Sizes are parsed to bytes so the sort is numeric rather than alphabetical, and the footer totals what was listed."
+        description = "Images on disk, largest first: reference, size, age, and a total. Narrow with `patterns` or `key=value` `filter`s; `dangling: false` hides untagged images."
     )]
     fn images(
         &self,
@@ -803,7 +746,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "usage",
-        description = "Where the disk went: `docker system df` with the totals line it leaves out and the reclaimable share worked out. Four rows — images, containers, volumes, build cache — then the total and what fraction of it you can have back, which is the number a decision gets made on. `detail` asks Docker for the per-item breakdown as well."
+        description = "`docker system df` with a total and the reclaimable share, for images, containers, volumes and build cache. `detail` adds the per-item breakdown."
     )]
     fn usage(
         &self,
@@ -824,7 +767,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "config",
-        description = "A compose project as it actually resolves, rather than the merged document. `docker compose config` answers an important question — what the overrides, profiles and `.env` interpolation produced — with several hundred lines of YAML; this renders the facts people go looking for: which image each service is really on, what it publishes, what it mounts, what it waits for. `mode` switches to `services` (names only), `images`, `resources` (declared volumes and networks, and which services use them — including the ones nothing uses), `profiles` (which services a `--profile` flag would bring up), or `validate` (run `docker compose config --quiet` and return only valid/invalid). `raw: true` leaves `${VAR}` unresolved. A compose file that does not parse comes back as the error line, which is usually the answer."
+        description = "A compose project as it resolves, with overrides, profiles and `.env` applied, as facts per service: image, ports, mounts, dependencies. `mode` selects another view; `raw: true` leaves `${VAR}` unresolved. A file that does not parse returns the error line."
     )]
     fn config(
         &self,
@@ -861,7 +804,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "events",
-        description = "A bounded window of the daemon's event stream: what happened to these containers in the last fifteen minutes, in order — the restarts, the OOM kills, the health transitions, with exit codes and signals attached. Replaces `docker events`, which without `--until` waits for the next event forever; the window here always has both ends. Narrow by `targets`, `types` or `actions`, widen with `since`. `collapse: true` turns a crash loop into one line and a count, which is the shape that question has."
+        description = "A bounded window of daemon events, in order: restarts, OOM kills, health transitions, with exit codes and signals. Both ends are always set; the default is the last 15 minutes. Narrow with `targets`, `types` or `actions`; `collapse: true` folds a crash loop into one line with a count."
     )]
     fn events(
         &self,
@@ -888,7 +831,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "compose",
-        description = "The compose lifecycle verbs, summarised rather than streamed: `up`, `down`, `start`, `stop`, `restart`, `kill`, `build`, `pull`, `create`, `rm`. `up` is always detached — an attached one never returns, and a tool call that never returns takes the conversation with it — and the forty lines of progress compose emits come back as one line per outcome, grouped by what happened to what. `down`, `rm` and `kill` need `confirm: true`, and the refusal says what would have gone; `volumes: true` is called out separately because named volumes are usually the data. `wait: true` returns when the containers are healthy rather than merely started. For anything beyond these verbs, use `passthrough`."
+        description = "Compose lifecycle verbs, summarised to one line per outcome: `up`, `down`, `start`, `stop`, `restart`, `kill`, `build`, `pull`, `create`, `rm`. `up` is always detached; `wait: true` returns once healthy. `down`, `rm` and `kill` need `confirm: true`, and `volumes: true` also deletes named volumes. For other verbs use `passthrough`."
     )]
     fn compose(
         &self,
@@ -932,7 +875,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "run",
-        description = "A bounded `docker run` for one-off and detached starts. Use this instead of passthrough for `docker run`: arguments are structured (`image`, `command`, `env`, `publish`, `volume`), output is line- and byte-capped, and detached starts return the container id in structured output. Safety rail: set `detach: true` for background containers or keep `rm: true` for ephemeral foreground runs."
+        description = "A bounded `docker run` with structured arguments and capped output; prefer it to `passthrough` for `docker run`. Set `detach: true` for a background container (its id is returned), or keep the default `rm: true` for a one-off run."
     )]
     fn run(&self, Parameters(params): Parameters<RunParams>) -> Result<CallToolResult, ErrorData> {
         if self.read_only {
@@ -969,7 +912,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "exec",
-        description = "A command in a container, with the filtering done here instead of in a pipe. Replaces `docker exec … | grep -v …`: `grep`, `exclude` and `max_lines` are parameters, so an installer's four hundred progress lines are never rendered and the one line that failed arrives with the exit status attached — which a pipeline throws away. Send the command as `argv` (a list, no quoting to get wrong) or, when you need a pipe or a redirect, as `shell`. No TTY is ever allocated: `-t` turns output into escape codes and `-i` waits for input that is not coming. `project`/`files` addresses a compose service instead of a container."
+        description = "A command in a container, with `grep`, `exclude` and `max_lines` applied here instead of in a pipe, and the exit status reported. Send `argv` as a list, or `shell` (run as `sh -c`) for pipes and redirects. No TTY is allocated. `project`/`files` addresses a compose service."
     )]
     fn exec(
         &self,
@@ -1006,7 +949,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "passthrough",
-        description = "Any other docker or compose subcommand, as an argument list: `cp`, `top`, `port`, `history`, `network inspect`, `volume prune`, `buildx bake`, `swarm init` — the rest of both CLIs, which is far too much to describe one tool at a time. What you give up is the rendering; what you keep is the byte budget, the deadline, the flag-injection guard and two rules. Nothing may stream: `attach`, `wait`, `compose watch`, `logs -f`, `stats` without `--no-stream`, `events` without `--until` and `compose up` without `-d` are refused by name, with a pointer to the bounded form. `-i` works with `stdin` as the input; `-t` works and its escape codes are stripped; `-it` runs as `-i`, since stdin is never a terminal. Nothing destroys state by accident: every subcommand is classed read, mutate or destroy from its verb, and a destroy needs `confirm: true`. An unrecognised subcommand is assumed to mutate. Prefer the dedicated tool when there is one — it renders the answer instead of the CLI's table."
+        description = "Any other docker or compose subcommand as an argument list (`cp`, `top`, `history`, `network inspect`, `volume prune`, …), under the same byte budget and deadline. Commands that never return are refused, naming the bounded form: `attach`, `wait`, `compose watch`, `logs -f`, `stats` without `--no-stream`, `events` without `--until`, `compose up` without `-d`. `-i` reads `stdin`; `-t` output has escape codes stripped; `-it` runs as `-i`. Subcommands are classed read, mutate or destroy by verb (unknown means mutate), and destroy needs `confirm: true`. Prefer a dedicated tool when one exists."
     )]
     fn passthrough(
         &self,
@@ -1035,7 +978,7 @@ impl DockerOpsServer {
 
     #[tool(
         name = "verify_startup",
-        description = "Cold-volume end-to-end startup validation for one or more images in one bounded call. For each image this tool creates an isolated fresh volume, runs the container detached with your env/publish settings, waits, probes a readiness URL (`probe_url`) up to `max_attempts`, captures a logs tail, and cleans up container+volume when asked. This replaces long shell loops that chain `docker run`, `curl`, `docker ps`, `docker logs`, and cleanup commands."
+        description = "Cold-start check of one or more images in one call. For each: create a fresh volume, run detached with `env`/`publish`, poll `probe_url` up to `max_attempts` times, capture a log tail, and clean up when `cleanup` is set. Returns pass/fail with evidence per image."
     )]
     fn verify_startup(
         &self,
